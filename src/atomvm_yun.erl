@@ -32,6 +32,10 @@ start() ->
 
     io:format("wakeup cause: ~p\n", [esp:sleep_get_wakeup_cause()]),
 
+    % First contact on a quiet bus; also logs which hat firmware is mounted.
+    ok = yun_hat:open(),
+    io:format("hat firmware: ~p\n", [yun_hat:version()]),
+
     Battery = m5_power:get_battery_level(),
     Reading =
         try measure_temperature() of
