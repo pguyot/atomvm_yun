@@ -71,6 +71,9 @@ maybe_sync_clock() ->
 
 interactive_wake() ->
     m5:begin_([{clear_display, true}]),
+    % The previous wake may have been a dark one that put the panel to
+    % sleep; begin_ alone does not always bring it back.
+    m5_display:wakeup(),
     m5_display:set_epd_mode(fastest),
     m5_display:set_brightness(128),
 
