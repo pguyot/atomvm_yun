@@ -2,21 +2,16 @@
 
 -export([start/0, test_yun_hat/0]).
 
--include_lib("atomvm_ulp/include/ulp.hrl").
-
--define(GPIO_SHT20_I2C_SCL, 26).
--define(GPIO_SHT20_I2C_SDA, 0).
--define(RTC_GPIO_SHT20_I2C_SCL, 7).
--define(RTC_GPIO_SHT20_I2C_SDA, 11).
-
 % BtnA on the M5StickC Plus, active low, RTC-capable (deep sleep wake)
 -define(GPIO_BTN_A, 37).
 
 % How long the reading stays on screen before going back to deep sleep
 -define(DISPLAY_TIMEOUT_MS, 3000).
 
-% Thermometer: wakes on BtnA, reads the SHT20 through the ULP, shows the
-% temperature big with a battery gauge top-right, then deep-sleeps again.
+% Thermometer: the ULP sampler (yun_sampler) reads the SHT20 every 5
+% minutes into a ring in RTC memory while everything sleeps. A BtnA wake
+% shows the temperature big with a battery gauge; timer wakes (hourly
+% harvest) will keep the display dark.
 start() ->
     m5:begin_([{clear_display, true}]),
     m5_display:set_epd_mode(fastest),
@@ -32,19 +27,28 @@ start() ->
 
     io:format("wakeup cause: ~p\n", [esp:sleep_get_wakeup_cause()]),
 
-    % First contact on a quiet bus; also logs which hat firmware is mounted.
+    Loaded = yun_sampler:ensure_loaded(),
+    io:format("sampler: ~p, count: ~p\n", [Loaded, yun_sampler:sample_count()]),
+
+    % First contact fenced from the ULP sampler; also logs which hat
+    % firmware is mounted.
+    ok = yun_sampler:acquire_bus(),
     ok = yun_hat:open(),
     io:format("hat firmware: ~p\n", [yun_hat:version()]),
+    ok = yun_sampler:release_bus(),
 
     Battery = m5_power:get_battery_level(),
+    % Display the ring's latest sample (<= 5 min old) rather than forcing
+    % a manual one: manual samples would pollute the log's 5-min cadence.
+    % Only a cold boot with an empty ring waits for a fresh sample.
     Reading =
-        try measure_temperature() of
-            Raw when Raw >= 16#FFF0 -> {error, Raw};
-            Raw -> {ok, Raw}
-        catch
-            exit:timeout -> {error, timeout}
+        case yun_sampler:latest() of
+            {error, no_sample_yet} -> yun_sampler:sample_now(3000);
+            Latest -> Latest
         end,
     io:format("battery: ~p, reading: ~p\n", [Battery, Reading]),
+    {Count, Recent} = yun_sampler:harvest((yun_sampler:sample_count() - 3) band 16#FFFF),
+    io:format("ring tail (count ~B): ~p\n", [Count, Recent]),
     draw_ui(Reading, Battery),
 
     timer:sleep(?DISPLAY_TIMEOUT_MS),
@@ -52,10 +56,9 @@ start() ->
     ok = esp:sleep_enable_ext0_wakeup(?GPIO_BTN_A, 0),
     esp:deep_sleep().
 
-% SHT20: T = -46.85 + 175.72 * S / 2^16, with the 2 status bits cleared.
-% Returns tenths of a degree Celsius as an integer.
+% Tenths of a degree Celsius from the raw SHT20 sample.
 raw_to_tenths(Raw) ->
-    round(((175.72 * (Raw band 16#FFFC)) / 65536 - 46.85) * 10).
+    (yun_sampler:raw_to_millicelsius(Raw) + 50) div 100.
 
 draw_ui({ok, Raw}, Battery) ->
     Tenths = raw_to_tenths(Raw),
@@ -138,279 +141,3 @@ test_yun_hat() ->
             m5_display:println(<<"Hat FW:ERR">>)
     end,
     m5_display:end_write().
-
-measure_temperature() ->
-    {ULPBinary, _Labels} = ulp:compile([
-        {label, read_value},
-        % read value: high bits
-        <<0:32>>,
-        % read value: low bits
-        <<0:32>>,
-
-        {movi, 2, next0},
-        {bxi, i2c_start},
-        {label, next0},
-        
-        % Write address (0x40, R/W=0: write)
-        ?I_MOVI(1, 2#10000000), % byte to write
-
-        {movi, 2, next1},
-        {bxi, write_byte},
-        {label, next1},
-
-        % Abort if NACK
-        ?I_JUMPR_LT(3, 1),
-        ?I_MOVI(1, 16#FFFE),
-        {bxi, error_x},
-
-        % Write command
-        ?I_MOVI(1, 2#11100011),
-
-        {movi, 2, next2},
-        {bxi, write_byte},
-        {label, next2},
-
-        % Abort if NACK
-        ?I_JUMPR_LT(3, 1),
-        ?I_MOVI(1, 16#FFFD),
-        {bxi, error_x},
-
-        {movi, 2, next3},
-        {bxi, i2c_stop},
-        {label, next3},
-
-        {movi, 2, next4},
-        {bxi, i2c_start},
-        {label, next4},
-
-        % Write address (0x40, R/W=1: read)
-        ?I_MOVI(1, 2#10000001),
-
-        {movi, 2, next5},
-        {bxi, write_byte},
-        {label, next5},
-
-        ?I_MOVI(1, 0),
-        ?I_MOVI(3, 0),  % ACK
-
-        % Read byte
-        {movi, 2, next6},
-        {bxi, read_byte},
-        {label, next6},
-
-        % Read byte
-        {movi, 2, next7},
-        {bxi, read_byte},
-        {label, next7},
-
-        {movi, 3, read_value},
-        ?I_ST(1, 3, 0),
-
-        ?I_MOVI(1, 0),
-        ?I_MOVI(3, 1),  % NACK
-
-        % Read byte
-        {movi, 2, next8},
-        {bxi, read_byte},
-        {label, next8},
-
-        {movi, 3, read_value},
-        ?I_ST(1, 3, 1),
-
-        {movi, 2, next9},
-        {bxi, i2c_stop},
-        {label, next9},
-
-        % One-shot: disable the ULP wakeup timer so the program doesn't
-        % re-run and bit-bang over the hardware I2C driver.
-        ?I_WR_RTC_CNTL_ULP_CP_SLP_TIMER_EN(0),
-        ?I_WAKE,
-        ?I_HALT,
-
-        % I2C Start
-        % Returns to address set by R2.
-        % On exit, SCL and SDA are driven low
-        {label, i2c_start},
-        % Let SDA be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 0),
-        % Let SCL be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 0),
-        % Wait for SCL to be high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SCL),
-        ?I_BL(-1, 1),
-        % Drive SDA low
-        ?I_WR_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SDA, 0),
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 1),
-        % Drive SCL low
-        ?I_WR_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SCL, 0),
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 1),
-        % Return
-        ?I_BXR(2),
-
-        % I2C Stop
-        % Returns to address set by R2.
-        {label, i2c_stop},
-        % Drive SDA low
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 1),
-        % Let SCL be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 0),
-        % Wait for SCL to be high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SCL),
-        ?I_BL(-1, 1),
-        % Let SDA be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 0),
-        % Ensure SDA is high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SDA),
-        {jumpr_ge, i2c_stop_exit, 1},
-        {bxi, arbitration_lost},
-        % Return
-        {label, i2c_stop_exit},
-        ?I_BXR(2),
-
-        % Write a byte
-        % Returns to address set by R2.
-        % Byte to write is in R1
-        % Stage counter and R0 are modified
-        % On exit, SCL is high
-        {label, write_byte},
-        ?I_STAGE_RST,
-
-        {label, write_byte_loop},
-        ?I_ANDI(0, 1, 16#80),
-        ?I_STAGE_INC(1),
-        ?I_LSHI(1, 1, 1),
-
-        {jumpr_ge, write_bit_high, 1},
-        % Drive SDA low
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 1),
-        % Let SCL be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 0),
-        % Wait for SCL to be high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SCL),
-        ?I_BL(-1, 1),
-        {bxi, write_byte_loop_continue},
-
-        {label, write_bit_high},
-        % Let SDA be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 0),
-        % Let SCL be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 0),
-        % Wait for SCL to be high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SCL),
-        ?I_BL(-1, 1),
-        % Ensure SDA is high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SDA),
-        {jumpr_ge, write_byte_loop_continue, 1},
-        {bxi, arbitration_lost},
-
-        {label, write_byte_loop_continue},
-        % Drive SCL low
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 1),
-        {jumps_lt, write_byte_loop, 8},
-
-        % Let SDA be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 0),
-        % Let SCL be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 0),
-        % Wait for SCL to be high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SCL),
-        ?I_BL(-1, 1),
-        % Read ACK/NACK
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SDA),
-        % Drive SCL low
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 1),
-        % Return
-        ?I_BXR(2),
-
-        % Read a byte
-        % R3 determines if it's ACK or NACK
-        % Byte is put into R1 which is shifted by 8 bits
-        % R0 is used
-        % Return address is R2.
-        {label, read_byte},
-        ?I_STAGE_RST,
-        {label, read_byte_loop},
-        % Shift before OR-ing the new bit in, so the last bit isn't
-        % over-shifted (R1 accumulates across both data bytes).
-        ?I_LSHI(1, 1, 1),
-        % Let SDA be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 0),
-        % Let SCL be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 0),
-        % Wait for SCL to be high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SCL),
-        ?I_BL(-1, 1),
-        % Read SDA
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SDA),
-        ?I_ORR(1, 1, 0),
-        % Drive SCL low
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 1),
-        ?I_STAGE_INC(1),
-        {jumps_lt, read_byte_loop, 8},
-
-        % Write ACK or NACK (R3)
-        ?I_MOVR(0, 3),
-        {jumpr_ge, read_byte_nack, 1},
-        % Write ACK
-        % Drive SDA low
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 1),
-        % Let SCL be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 0),
-        % Wait for SCL to be high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SCL),
-        ?I_BL(-1, 1),
-        {bxi, read_byte_exit},
-
-        {label, read_byte_nack},
-        % Let SDA be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 0),
-        % Let SCL be driven by pull up
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 0),
-        % Wait for SCL to be high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SCL),
-        ?I_BL(-1, 1),
-        % Ensure SDA is high
-        ?I_RD_RTC_GPIO(?RTC_GPIO_SHT20_I2C_SDA),
-        {jumpr_ge, read_byte_exit, 1},        
-        {bxi, arbitration_lost},
-
-        {label, read_byte_exit},
-        % Drive SCL low
-        ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 1),
-        % Return
-        ?I_BXR(2),
-
-        {label, arbitration_lost},
-        ?I_MOVI(1, 16#FFFF),
-        {label, error_x},
-        {movi, 3, read_value},
-        ?I_ST(1, 3, 0),
-        ?I_WR_RTC_CNTL_ULP_CP_SLP_TIMER_EN(0),
-        ?I_WAKE,
-        ?I_HALT
-    ]),
-    io:format("Program size = ~B\n", [byte_size(ULPBinary)]),
-    ulp:load_binary(ULPBinary),
-    ?RTC_GPIO_SHT20_I2C_SCL = rtc_gpio:gpio_to_rtc_gpio(?GPIO_SHT20_I2C_SCL),
-    ?RTC_GPIO_SHT20_I2C_SDA = rtc_gpio:gpio_to_rtc_gpio(?GPIO_SHT20_I2C_SDA),
-    % configure pins
-    rtc_gpio:init(?GPIO_SHT20_I2C_SCL),
-    rtc_gpio:set_direction(?GPIO_SHT20_I2C_SCL, input_output),
-    rtc_gpio:pulldown_dis(?GPIO_SHT20_I2C_SCL),
-    rtc_gpio:pullup_en(?GPIO_SHT20_I2C_SCL),
-    rtc_gpio:init(?GPIO_SHT20_I2C_SDA),
-    rtc_gpio:set_direction(?GPIO_SHT20_I2C_SDA, input_output),
-    rtc_gpio:pulldown_dis(?GPIO_SHT20_I2C_SDA),
-    rtc_gpio:pullup_en(?GPIO_SHT20_I2C_SDA),
-    {ok, {Handler, Ref}} = ulp:isr_register(),
-    ulp:run(2),
-    receive
-        {ulp, Ref} ->
-            true = ulp:isr_deregister(Handler),
-            Mem0 = ulp:read_memory(0),
-            % read_value[0] = 16-bit raw temperature (or an 16#FFFx error
-            % sentinel), read_value[1] = CRC byte, unchecked for now
-            Mem0 band 16#FFFF
-    after 1000 ->
-        exit(timeout)
-    end.
