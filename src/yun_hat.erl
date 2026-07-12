@@ -107,10 +107,21 @@ write_command(Data) ->
 
 % Command followed by a read-back, as two separate STOP-terminated
 % transactions (the firmware only interprets the command after STOP).
+% The read also gets a retry: the STM32 re-arms its I2C listener from an
+% interrupt handler after the command's STOP, and a read START arriving
+% before that is NACKed.
 read_command(Command, ReadLen) ->
     case write_command(Command) of
-        ok -> raw_read(ReadLen);
-        error -> error
+        ok ->
+            case raw_read(ReadLen) of
+                {ok, Data} ->
+                    {ok, Data};
+                error ->
+                    timer:sleep(?WAKE_RETRY_DELAY_MS),
+                    raw_read(ReadLen)
+            end;
+        error ->
+            error
     end.
 
 raw_write(Data) ->

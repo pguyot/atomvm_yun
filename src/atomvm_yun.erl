@@ -37,7 +37,12 @@ start() ->
     m5_display:println(IMUName),
 
     m5_display:end_write(),
-    
+
+    % Talk to the hat STM32 before the ULP bit-bangs the shared bus: its
+    % traffic wakes the STM32 mid-transaction, which can latch BUSY
+    % (errata DM00091791) until the firmware learns to recover from it.
+    test_yun_hat(),
+
     try
         Temperature = measure_temperature(),
     
@@ -52,10 +57,38 @@ start() ->
         m5_display:println(<<"TIMEOUT">>),
         m5_display:end_write()
     end,
-    
+
     timer:sleep(5000),
     m5_power:deep_sleep(),
     ok.
+
+% Exercise the YUN Hat STM32 running the low-power firmware (YUN/README.md):
+% version read proves the wake-retry works, LEDs prove 0x01 is intact, light
+% proves the ADC restarts after Stop mode.
+test_yun_hat() ->
+    ok = yun_hat:open(),
+    m5_display:start_write(),
+    case yun_hat:version() of
+        {ok, Version} ->
+            io:format("YUN hat firmware version ~B\n", [Version]),
+            m5_display:print(<<"Hat FW:">>),
+            m5_display:println(integer_to_binary(Version)),
+            ok = yun_hat:set_all({0, 16, 0}),
+            case yun_hat:light() of
+                {ok, Light} ->
+                    io:format("YUN hat light = ~B\n", [Light]),
+                    m5_display:print(<<"Light:">>),
+                    m5_display:println(integer_to_binary(Light));
+                error ->
+                    io:format("YUN hat light read failed\n"),
+                    m5_display:println(<<"Light:ERR">>)
+            end,
+            ok = yun_hat:sleep();
+        error ->
+            io:format("YUN hat version read failed (factory firmware?)\n"),
+            m5_display:println(<<"Hat FW:ERR">>)
+    end,
+    m5_display:end_write().
 
 measure_temperature() ->
     {ULPBinary, _Labels} = ulp:compile([
@@ -69,8 +102,8 @@ measure_temperature() ->
         {bxi, i2c_start},
         {label, next0},
         
-        % Write address
-        ?I_MOVI(1, 2#10000001), % byte to write
+        % Write address (0x40, R/W=0: write)
+        ?I_MOVI(1, 2#10000000), % byte to write
 
         {movi, 2, next1},
         {bxi, write_byte},
@@ -101,8 +134,8 @@ measure_temperature() ->
         {bxi, i2c_start},
         {label, next4},
 
-        % Write address
-        ?I_MOVI(1, 2#10000000),
+        % Write address (0x40, R/W=1: read)
+        ?I_MOVI(1, 2#10000001),
 
         {movi, 2, next5},
         {bxi, write_byte},
@@ -139,6 +172,9 @@ measure_temperature() ->
         {bxi, i2c_stop},
         {label, next9},
 
+        % One-shot: disable the ULP wakeup timer so the program doesn't
+        % re-run and bit-bang over the hardware I2C driver.
+        ?I_WR_RTC_CNTL_ULP_CP_SLP_TIMER_EN(0),
         ?I_WAKE,
         ?I_HALT,
 
@@ -245,6 +281,9 @@ measure_temperature() ->
         {label, read_byte},
         ?I_STAGE_RST,
         {label, read_byte_loop},
+        % Shift before OR-ing the new bit in, so the last bit isn't
+        % over-shifted (R1 accumulates across both data bytes).
+        ?I_LSHI(1, 1, 1),
         % Let SDA be driven by pull up
         ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SDA, 0),
         % Let SCL be driven by pull up
@@ -257,7 +296,6 @@ measure_temperature() ->
         ?I_ORR(1, 1, 0),
         % Drive SCL low
         ?I_WR_RTC_GPIO_ENABLE(?RTC_GPIO_SHT20_I2C_SCL, 1),
-        ?I_LSHI(1, 1, 1),
         ?I_STAGE_INC(1),
         {jumps_lt, read_byte_loop, 8},
 
@@ -298,6 +336,7 @@ measure_temperature() ->
         {label, error_x},
         {movi, 3, read_value},
         ?I_ST(1, 3, 0),
+        ?I_WR_RTC_CNTL_ULP_CP_SLP_TIMER_EN(0),
         ?I_WAKE,
         ?I_HALT
     ]),
