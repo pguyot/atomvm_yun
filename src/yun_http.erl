@@ -12,7 +12,7 @@
 %
 -module(yun_http).
 
--export([serve/2]).
+-export([serve/3]).
 
 -define(MAX_RECORDS, 168).
 
@@ -22,15 +22,24 @@
 % Hard ceiling on a serve session, whatever the request pattern: the
 % battery must win over a tab left polling in someone's pocket.
 -define(MAX_SERVE_MS, 600000).
+% Accept in short slices so the tick callback (button poll, display
+% timeout) runs regularly while serving.
+-define(SLICE_MS, 300).
 
--spec serve(Battery :: 0..255, InactivityMs :: pos_integer()) -> ok.
-serve(Battery, InactivityMs) ->
+%% @doc Serve until InactivityMs pass without a request (a button press
+%% via the tick callback also counts as activity). Tick is called every
+%% ~?SLICE_MS and returns pressed | idle.
+-spec serve(Battery :: 0..255, InactivityMs :: pos_integer(), Tick :: fun(() -> pressed | idle)) ->
+    ok.
+serve(Battery, InactivityMs, Tick) ->
     case gen_tcp:listen(80, [binary, {active, false}, {reuseaddr, true}]) of
         {ok, ListenSock} ->
             io:format("http listening on 80\n"),
             Html = atomvm:read_priv(atomvm_yun, "index.html"),
-            Deadline = erlang:monotonic_time(millisecond) + ?MAX_SERVE_MS,
-            accept_loop(ListenSock, Html, Battery, InactivityMs, Deadline),
+            Now = erlang:monotonic_time(millisecond),
+            accept_loop(
+                ListenSock, Html, Battery, InactivityMs, Tick, Now, Now + ?MAX_SERVE_MS
+            ),
             gen_tcp:close(ListenSock),
             ok;
         {error, Reason} ->
@@ -38,20 +47,35 @@ serve(Battery, InactivityMs) ->
             ok
     end.
 
-accept_loop(ListenSock, Html, Battery, InactivityMs, Deadline) ->
+accept_loop(ListenSock, Html, Battery, InactivityMs, Tick, LastActivity, Deadline) ->
     drain_sntp(),
-    Left = Deadline - erlang:monotonic_time(millisecond),
-    case Left =< 0 of
+    Now = erlang:monotonic_time(millisecond),
+    case Now >= Deadline orelse Now - LastActivity >= InactivityMs of
         true ->
             ok;
         false ->
-            case gen_tcp:accept(ListenSock, min(InactivityMs, Left)) of
+            LastActivity1 =
+                case Tick() of
+                    pressed -> Now;
+                    idle -> LastActivity
+                end,
+            case gen_tcp:accept(ListenSock, ?SLICE_MS) of
                 {ok, Sock} ->
                     _ = handle(Sock, Html, Battery),
                     gen_tcp:close(Sock),
-                    accept_loop(ListenSock, Html, Battery, InactivityMs, Deadline);
+                    accept_loop(
+                        ListenSock,
+                        Html,
+                        Battery,
+                        InactivityMs,
+                        Tick,
+                        erlang:monotonic_time(millisecond),
+                        Deadline
+                    );
                 {error, timeout} ->
-                    ok;
+                    accept_loop(
+                        ListenSock, Html, Battery, InactivityMs, Tick, LastActivity1, Deadline
+                    );
                 {error, Reason} ->
                     io:format("http accept failed: ~p\n", [Reason]),
                     ok

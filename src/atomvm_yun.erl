@@ -119,13 +119,10 @@ interactive_wake() ->
             io:format("serving at ~s\n", [Url]),
             m5_display:set_text_size(1),
             m5_display:draw_string(Url, 8, m5_display:height() - 12),
-            % Serving continues in the dark: long enough to read the URL,
-            % then the display sleeps while HTTP stays up.
-            spawn(fun() ->
-                timer:sleep(15000),
-                m5_display:sleep()
-            end),
-            yun_http:serve(battery_byte(), 90000),
+            % Serving continues in the dark after 15 s; pressing BtnA
+            % while serving relights and redraws (handled by the tick).
+            put(display_off_at, erlang:monotonic_time(millisecond) + 15000),
+            yun_http:serve(battery_byte(), 90000, fun() -> serve_tick(Reading, Url) end),
             yun_net:down();
         {error, not_provisioned} ->
             timer:sleep(?DISPLAY_TIMEOUT_MS);
@@ -211,6 +208,45 @@ battery_byte() ->
                 is_charging -> Level bor 16#80;
                 _ -> Level
             end
+    end.
+
+% Runs every ~300 ms while the HTTP server is up: BtnA relights the
+% display with a fresh reading; the display sleeps again 15 s later.
+% State lives in the process dictionary of the serving process.
+serve_tick(Reading0, Url) ->
+    m5:update(),
+    Pressed = m5_btn_a:was_pressed(),
+    case Pressed of
+        true ->
+            m5_display:wakeup(),
+            m5_display:set_brightness(128),
+            Reading =
+                case yun_sampler:latest() of
+                    {error, _} -> Reading0;
+                    Latest -> Latest
+                end,
+            draw_ui(Reading, m5_power:get_battery_level()),
+            m5_display:set_text_size(1),
+            m5_display:draw_string(Url, 8, m5_display:height() - 12),
+            put(display_off_at, erlang:monotonic_time(millisecond) + 15000);
+        false ->
+            ok
+    end,
+    case get(display_off_at) of
+        undefined ->
+            ok;
+        OffAt ->
+            case erlang:monotonic_time(millisecond) >= OffAt of
+                true ->
+                    m5_display:sleep(),
+                    put(display_off_at, undefined);
+                false ->
+                    ok
+            end
+    end,
+    case Pressed of
+        true -> pressed;
+        false -> idle
     end.
 
 % The red LED (active low) is not an indicator of anything -- turn it
