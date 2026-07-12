@@ -8,11 +8,37 @@
 % How long the reading stays on screen before going back to deep sleep
 -define(DISPLAY_TIMEOUT_MS, 3000).
 
+% Samples per log record; the sleep timer aims to wake with this many
+% pending, giving ~hourly harvests at the 5-minute cadence.
+-define(HARVEST_BATCH, 12).
+-define(NVS_NS, atomvm_yun).
+-define(NVS_HARVEST_COUNT, harvest_count).
+
+% Unix time below which the clock is clearly not SNTP-synchronized.
+-define(PLAUSIBLE_TIME, 1600000000).
+
 % Thermometer: the ULP sampler (yun_sampler) reads the SHT20 every 5
-% minutes into a ring in RTC memory while everything sleeps. A BtnA wake
-% shows the temperature big with a battery gauge; timer wakes (hourly
-% harvest) will keep the display dark.
+% minutes into a ring in RTC memory while everything sleeps. Roughly
+% every hour a dark timer wake harvests the ring (plus a battery
+% reading) into the flash log. A BtnA wake additionally shows the
+% temperature big with a battery gauge.
 start() ->
+    Cause = esp:sleep_get_wakeup_cause(),
+    io:format("wakeup cause: ~p\n", [Cause]),
+    case Cause of
+        sleep_wakeup_timer -> dark_wake();
+        _ -> interactive_wake()
+    end.
+
+% Hourly harvest: no display, minimal time awake.
+dark_wake() ->
+    m5:begin_([{clear_display, false}]),
+    m5_display:sleep(),
+    _ = yun_sampler:ensure_loaded(),
+    harvest_if_due(),
+    go_to_sleep().
+
+interactive_wake() ->
     m5:begin_([{clear_display, true}]),
     m5_display:set_epd_mode(fastest),
     m5_display:set_brightness(128),
@@ -24,8 +50,6 @@ start() ->
         false ->
             ok
     end,
-
-    io:format("wakeup cause: ~p\n", [esp:sleep_get_wakeup_cause()]),
 
     Loaded = yun_sampler:ensure_loaded(),
     io:format("sampler: ~p, count: ~p\n", [Loaded, yun_sampler:sample_count()]),
@@ -47,14 +71,80 @@ start() ->
             Latest -> Latest
         end,
     io:format("battery: ~p, reading: ~p\n", [Battery, Reading]),
-    {Count, Recent} = yun_sampler:harvest((yun_sampler:sample_count() - 3) band 16#FFFF),
-    io:format("ring tail (count ~B): ~p\n", [Count, Recent]),
     draw_ui(Reading, Battery),
+    harvest_if_due(),
 
     timer:sleep(?DISPLAY_TIMEOUT_MS),
     m5_display:sleep(),
+    go_to_sleep().
+
+go_to_sleep() ->
+    % Without this the sampler (program + ring) is wiped in deep sleep.
+    ok = ulp:keep_memory_in_deep_sleep(),
     ok = esp:sleep_enable_ext0_wakeup(?GPIO_BTN_A, 0),
-    esp:deep_sleep().
+    esp:deep_sleep(ms_until_harvest()).
+
+% Move complete batches from the sampler ring to the flash log. Runs on
+% every wake; does nothing until a full batch is pending, so button
+% presses between hourly wakes stay cheap.
+harvest_if_due() ->
+    Last = nvs_harvest_count(),
+    {Count, Samples} = yun_sampler:harvest(Last),
+    case length(Samples) >= ?HARVEST_BATCH of
+        true ->
+            Battery =
+                case m5_power:get_battery_level() of
+                    L when is_integer(L), L >= 0, L =< 100 -> L;
+                    _ -> 16#FF
+                end,
+            Now = erlang:system_time(second),
+            Ts =
+                case Now >= ?PLAUSIBLE_TIME of
+                    true -> Now;
+                    false -> 0
+                end,
+            append_batches(Samples, Ts, Battery),
+            esp:nvs_put_binary(?NVS_NS, ?NVS_HARVEST_COUNT, <<Count:16/little>>),
+            io:format("harvested ~B samples (count ~B)\n", [length(Samples), Count]);
+        false ->
+            ok
+    end.
+
+% Oldest-first samples, chunked into records of up to ?HARVEST_BATCH;
+% each record is stamped with the time of its newest sample, spaced by
+% the 5-minute cadence.
+append_batches([], _Ts, _Battery) ->
+    ok;
+append_batches(Samples, Ts, Battery) ->
+    PeriodS = yun_sampler:sample_period_us() div 1000000,
+    Total = length(Samples),
+    case Total > ?HARVEST_BATCH of
+        true ->
+            {Chunk, Rest} = lists:split(?HARVEST_BATCH, Samples),
+            ChunkTs =
+                case Ts of
+                    0 -> 0;
+                    _ -> Ts - length(Rest) * PeriodS
+                end,
+            ok = yun_log:append(ChunkTs, Battery, Chunk),
+            append_batches(Rest, Ts, Battery);
+        false ->
+            ok = yun_log:append(Ts, Battery, Samples)
+    end.
+
+nvs_harvest_count() ->
+    case esp:nvs_get_binary(?NVS_NS, ?NVS_HARVEST_COUNT) of
+        <<C:16/little>> -> C;
+        _ -> 0
+    end.
+
+% Sleep until a full batch is pending (self-aligning to the sampler's
+% cadence), with a small margin so the batch is complete when we wake.
+ms_until_harvest() ->
+    Pending = (yun_sampler:sample_count() - nvs_harvest_count()) band 16#FFFF,
+    Missing = max(?HARVEST_BATCH - Pending, 0),
+    PeriodMs = yun_sampler:sample_period_us() div 1000,
+    max(Missing * PeriodMs + 20000, 60000).
 
 % Tenths of a degree Celsius from the raw SHT20 sample.
 raw_to_tenths(Raw) ->
