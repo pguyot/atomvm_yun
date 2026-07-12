@@ -27,16 +27,42 @@ start() ->
     io:format("wakeup cause: ~p\n", [Cause]),
     case Cause of
         sleep_wakeup_timer -> dark_wake();
+        sleep_wakeup_ulp -> dark_wake();
         _ -> interactive_wake()
     end.
 
-% Hourly harvest: no display, minimal time awake.
+% Hourly harvest: no display, minimal time awake. Once a day (or until
+% first success) the clock is SNTP-synchronized so log timestamps are
+% absolute.
 dark_wake() ->
     m5:begin_([{clear_display, false}]),
     m5_display:sleep(),
     _ = yun_sampler:ensure_loaded(),
     harvest_if_due(),
+    maybe_sync_clock(),
     go_to_sleep().
+
+maybe_sync_clock() ->
+    case yun_net:provisioned() andalso yun_net:sync_due() of
+        true ->
+            case yun_net:up() of
+                {ok, _Ip} ->
+                    receive
+                        sntp_synchronized ->
+                            yun_net:mark_synced(),
+                            io:format("clock synchronized: ~p\n", [
+                                erlang:system_time(second)
+                            ])
+                    after 20000 ->
+                        io:format("sntp sync timed out\n")
+                    end,
+                    yun_net:down();
+                Error ->
+                    io:format("wifi for sntp failed: ~p\n", [Error])
+            end;
+        false ->
+            ok
+    end.
 
 interactive_wake() ->
     m5:begin_([{clear_display, true}]),
@@ -74,12 +100,40 @@ interactive_wake() ->
     draw_ui(Reading, Battery),
     harvest_if_due(),
 
-    timer:sleep(?DISPLAY_TIMEOUT_MS),
+    % Serve the web app while the user is looking at the device; each
+    % request extends the window, so a phone actively fetching keeps it
+    % alive. Unprovisioned devices just show the reading.
+    case yun_net:up() of
+        {ok, {A, B, C, D}} ->
+            Url = list_to_binary(
+                io_lib:format("http://~s.local  ~B.~B.~B.~B", [yun_net:name(), A, B, C, D])
+            ),
+            io:format("serving at ~s\n", [Url]),
+            m5_display:set_text_size(1),
+            m5_display:draw_string(Url, 8, m5_display:height() - 12),
+            BatteryByte =
+                case Battery of
+                    L when is_integer(L), L >= 0, L =< 100 -> L;
+                    _ -> 16#FF
+                end,
+            yun_http:serve(BatteryByte, 90000),
+            yun_net:down();
+        {error, not_provisioned} ->
+            timer:sleep(?DISPLAY_TIMEOUT_MS);
+        {error, Error} ->
+            io:format("wifi failed: ~p\n", [Error]),
+            timer:sleep(?DISPLAY_TIMEOUT_MS)
+    end,
     m5_display:sleep(),
     go_to_sleep().
 
 go_to_sleep() ->
-    % Without this the sampler (program + ring) is wiped in deep sleep.
+    % Both are needed for the sampler to live through deep sleep: the
+    % ULP wakeup trigger keeps the FSM timer clocked (and its memory
+    % considered in use), and the pd override pins RTC slow memory on.
+    % Timer runs never execute WAKE (only wake_request ones do), so the
+    % trigger does not cause spurious CPU wakes.
+    ok = esp:sleep_enable_ulp_wakeup(),
     ok = ulp:keep_memory_in_deep_sleep(),
     ok = esp:sleep_enable_ext0_wakeup(?GPIO_BTN_A, 0),
     esp:deep_sleep(ms_until_harvest()).

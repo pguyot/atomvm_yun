@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thermometer</title>
+<style>
+  :root {
+    --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8984;
+    --series: #2a78d6; --grid: #e8e7e3; --chip: #f1f0ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #7f7e76;
+      --series: #3987e5; --grid: #33322f; --chip: #262624;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--surface); color: var(--ink);
+    font: 16px/1.45 -apple-system, system-ui, sans-serif;
+    max-width: 640px; margin: 0 auto; padding: 16px;
+  }
+  header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  #name { font-size: 20px; font-weight: 650; background: none; border: none;
+          color: var(--ink); border-bottom: 1px dashed var(--ink-3); padding: 0;
+          width: 11ch; font-family: inherit; }
+  .chip { background: var(--chip); color: var(--ink-2); border-radius: 999px;
+          padding: 2px 10px; font-size: 13px; white-space: nowrap; }
+  #updated { color: var(--ink-3); font-size: 13px; margin-left: auto; }
+  .hero { margin: 18px 0 4px; }
+  .hero b { font-size: 56px; font-weight: 700; letter-spacing: -1px; }
+  .hero span { color: var(--ink-2); font-size: 20px; }
+  .filters { display: flex; gap: 6px; margin: 14px 0 6px; }
+  .filters button {
+    background: var(--chip); color: var(--ink-2); border: none; border-radius: 8px;
+    padding: 5px 12px; font: inherit; font-size: 14px;
+  }
+  .filters button[aria-pressed="true"] { background: var(--series); color: #fff; }
+  #chartwrap { position: relative; }
+  #tip { position: absolute; pointer-events: none; background: var(--ink);
+         color: var(--surface); border-radius: 6px; padding: 3px 8px;
+         font-size: 13px; display: none; white-space: nowrap; transform: translate(-50%, -130%); }
+  svg { display: block; width: 100%; height: auto; }
+  details { margin-top: 18px; color: var(--ink-2); font-size: 14px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+  td, th { text-align: left; padding: 3px 8px 3px 0; border-bottom: 1px solid var(--grid); }
+  #status { color: var(--ink-3); font-size: 13px; min-height: 1.2em; margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <input id="name" value="thermometer" aria-label="device name">
+  <span class="chip" id="battery">--%</span>
+  <span id="updated">never updated</span>
+</header>
+<div class="hero"><b id="temp">--.-</b><span> °C</span></div>
+<div class="filters" role="group" aria-label="time range">
+  <button data-h="24" aria-pressed="true">24 h</button>
+  <button data-h="72" aria-pressed="false">3 d</button>
+  <button data-h="168" aria-pressed="false">7 d</button>
+</div>
+<div id="chartwrap">
+  <svg id="chart" viewBox="0 0 640 300" role="img" aria-label="temperature over time"></svg>
+  <div id="tip"></div>
+</div>
+<div id="status"></div>
+<details><summary>Data table</summary><div id="table"></div></details>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const KEY = "yun-data";
+let data = null, hours = 24, points = [];
+
+const mc = raw => -46.85 + 175.72 * (raw & 0xFFFC) / 65536;
+const fmtT = t => {
+  const d = new Date(t * 1000);
+  return d.toLocaleDateString(undefined, {weekday: "short"}) + " " +
+         d.toLocaleTimeString(undefined, {hour: "2-digit", minute: "2-digit"});
+};
+
+function flatten(d) {
+  // records: oldest first; each has t (unix of newest sample, 0 = clock
+  // unsynced), samples oldest first, spaced period_s
+  const pts = [];
+  for (const r of d.records) {
+    if (!r.t) continue;
+    r.s.forEach((raw, i) => {
+      const t = r.t - (r.s.length - 1 - i) * d.period_s;
+      pts.push({t, v: raw >= 0xFFF0 ? null : mc(raw)});
+    });
+  }
+  return pts.sort((a, b) => a.t - b.t);
+}
+
+function render() {
+  if (!data) return;
+  $("battery").textContent = data.battery <= 100 ? data.battery + "%" : "--%";
+  $("temp").textContent = data.temp_mc === null ? "--.-" : (data.temp_mc / 1000).toFixed(1);
+  if (document.activeElement !== $("name")) $("name").value = data.name;
+  const age = Math.round(Date.now() / 1000 - data.fetched_at);
+  $("updated").textContent = age < 90 ? "just updated" :
+    age < 5400 ? "updated " + Math.round(age / 60) + " min ago" :
+    "updated " + fmtT(data.fetched_at);
+  points = flatten(data);
+  drawChart();
+  drawTable();
+}
+
+function drawChart() {
+  const svg = $("chart"), W = 640, H = 300, L = 42, R = 8, T = 12, B = 30;
+  const cut = (data.fetched_at || Date.now() / 1000) - hours * 3600;
+  const pts = points.filter(p => p.t >= cut);
+  if (pts.length < 2) { svg.innerHTML =
+    `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="var(--ink-3)" font-size="15">not enough data yet</text>`;
+    return; }
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  const vs = pts.filter(p => p.v !== null).map(p => p.v);
+  let v0 = Math.min(...vs), v1 = Math.max(...vs);
+  const pad = Math.max((v1 - v0) * 0.15, 0.5); v0 -= pad; v1 += pad;
+  const x = t => L + (W - L - R) * (t - t0) / (t1 - t0 || 1);
+  const y = v => T + (H - T - B) * (1 - (v - v0) / (v1 - v0));
+  let g = "";
+  // recessive y grid on ~5 nice ticks
+  const step = niceStep((v1 - v0) / 4);
+  for (let v = Math.ceil(v0 / step) * step; v <= v1; v += step) {
+    g += `<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)" stroke-width="1"/>`;
+    g += `<text x="${L-6}" y="${y(v)+4}" text-anchor="end" fill="var(--ink-3)" font-size="12">${v.toFixed(step < 1 ? 1 : 0)}</text>`;
+  }
+  // x labels: 4 evenly spaced
+  for (let i = 0; i <= 3; i++) {
+    const t = t0 + (t1 - t0) * i / 3;
+    const anchor = i === 0 ? "start" : i === 3 ? "end" : "middle";
+    g += `<text x="${x(t)}" y="${H-8}" text-anchor="${anchor}" fill="var(--ink-3)" font-size="12">${fmtT(t)}</text>`;
+  }
+  // the line, broken at nulls (sensor errors leave gaps, not lies)
+  let dstr = "", pen = false;
+  for (const p of pts) {
+    if (p.v === null) { pen = false; continue; }
+    dstr += (pen ? "L" : "M") + x(p.t).toFixed(1) + " " + y(p.v).toFixed(1);
+    pen = true;
+  }
+  g += `<path d="${dstr}" fill="none" stroke="var(--series)" stroke-width="2" stroke-linejoin="round"/>`;
+  g += `<line id="cross" y1="${T}" y2="${H-B}" stroke="var(--ink-3)" stroke-width="1" visibility="hidden"/>`;
+  g += `<circle id="dot" r="4" fill="var(--series)" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>`;
+  svg.innerHTML = g;
+  svg.onpointermove = ev => hover(ev, pts, x, y, W, L, R);
+  svg.onpointerleave = () => { $("tip").style.display = "none";
+    cross().setAttribute("visibility", "hidden"); dot().setAttribute("visibility", "hidden"); };
+}
+const cross = () => $("chart").querySelector("#cross");
+const dot = () => $("chart").querySelector("#dot");
+
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 5, 10]) if (m * p >= raw) return m * p;
+  return 10 * p;
+}
+
+function hover(ev, pts, x, y, W, L, R) {
+  const box = $("chart").getBoundingClientRect();
+  const px = (ev.clientX - box.left) * 640 / box.width;
+  let best = null, bd = 1e9;
+  for (const p of pts) {
+    if (p.v === null) continue;
+    const d = Math.abs(x(p.t) - px);
+    if (d < bd) { bd = d; best = p; }
+  }
+  if (!best) return;
+  const cx = x(best.t), cy = y(best.v);
+  cross().setAttribute("x1", cx); cross().setAttribute("x2", cx);
+  cross().setAttribute("visibility", "visible");
+  dot().setAttribute("cx", cx); dot().setAttribute("cy", cy);
+  dot().setAttribute("visibility", "visible");
+  const tip = $("tip");
+  tip.textContent = best.v.toFixed(2) + " °C · " + fmtT(best.t);
+  tip.style.left = (cx * box.width / 640) + "px";
+  tip.style.top = (cy * box.height / 300) + "px";
+  tip.style.display = "block";
+}
+
+function drawTable() {
+  const rows = points.slice(-48).reverse().map(p =>
+    `<tr><td>${fmtT(p.t)}</td><td>${p.v === null ? "error" : p.v.toFixed(2) + " °C"}</td></tr>`);
+  $("table").innerHTML =
+    `<table><tr><th>time</th><th>temperature</th></tr>${rows.join("")}</table>`;
+}
+
+async function fetchData(silent) {
+  try {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 6000);
+    const rsp = await fetch("/data.json", {signal: ctrl.signal, cache: "no-store"});
+    const d = await rsp.json();
+    d.fetched_at = Math.round(Date.now() / 1000);
+    data = d;
+    localStorage.setItem(KEY, JSON.stringify(d));
+    $("status").textContent = "";
+    render();
+    return true;
+  } catch (e) {
+    if (!silent) $("status").textContent =
+      "device not reachable — press its button to wake it, retrying…";
+    return false;
+  }
+}
+
+async function poll() {
+  // the stick serves ~90 s after a button press; retry patiently
+  for (let i = 0; i < 20; i++) {
+    if (await fetchData(i > 0)) { setTimeout(poll, 60000); return; }
+    await new Promise(r => setTimeout(r, 3000 + i * 1000));
+  }
+  $("status").textContent = "gave up — press the device button, then tap here";
+  $("status").onclick = () => { $("status").onclick = null; poll(); };
+}
+
+$("name").addEventListener("change", async () => {
+  const n = $("name").value.trim();
+  if (!n) return;
+  try {
+    await fetch("/name", {method: "POST", body: n});
+    $("status").textContent = "renamed — new name is used after the next wake";
+  } catch (e) { $("status").textContent = "rename failed (device asleep?)"; }
+});
+
+for (const b of document.querySelectorAll(".filters button")) {
+  b.onclick = () => {
+    document.querySelectorAll(".filters button").forEach(x => x.setAttribute("aria-pressed", "false"));
+    b.setAttribute("aria-pressed", "true");
+    hours = +b.dataset.h;
+    drawChart();
+  };
+}
+
+const cached = localStorage.getItem(KEY);
+if (cached) { data = JSON.parse(cached); render(); }
+poll();
+</script>
+</body>
+</html>
