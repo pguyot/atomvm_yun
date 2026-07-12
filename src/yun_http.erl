@@ -36,10 +36,14 @@ serve(Battery, InactivityMs, Tick) ->
         {ok, ListenSock} ->
             io:format("http listening on 80\n"),
             Html = atomvm:read_priv(atomvm_yun, "index.html"),
+            % gen_tcp:accept/2 timeouts never fire on this AtomVM build,
+            % so a dedicated process blocks in accept while this one owns
+            % all timing (tick, inactivity, deadline). Closing the listen
+            % socket ends the acceptor.
+            Main = self(),
+            spawn(fun() -> acceptor(ListenSock, Html, Battery, Main) end),
             Now = erlang:monotonic_time(millisecond),
-            accept_loop(
-                ListenSock, Html, Battery, InactivityMs, Tick, Now, Now + ?MAX_SERVE_MS
-            ),
+            main_loop(InactivityMs, Tick, Now, Now + ?MAX_SERVE_MS),
             gen_tcp:close(ListenSock),
             ok;
         {error, Reason} ->
@@ -47,50 +51,40 @@ serve(Battery, InactivityMs, Tick) ->
             ok
     end.
 
-accept_loop(ListenSock, Html, Battery, InactivityMs, Tick, LastActivity, Deadline) ->
-    drain_sntp(),
+acceptor(ListenSock, Html, Battery, Main) ->
+    case gen_tcp:accept(ListenSock) of
+        {ok, Sock} ->
+            Main ! http_activity,
+            _ = handle(Sock, Html, Battery),
+            gen_tcp:close(Sock),
+            acceptor(ListenSock, Html, Battery, Main);
+        {error, _Closed} ->
+            ok
+    end.
+
+main_loop(InactivityMs, Tick, LastActivity, Deadline) ->
     Now = erlang:monotonic_time(millisecond),
     case Now >= Deadline orelse Now - LastActivity >= InactivityMs of
         true ->
             ok;
         false ->
             LastActivity1 =
-                case Tick() of
-                    pressed -> Now;
-                    idle -> LastActivity
+                receive
+                    http_activity ->
+                        erlang:monotonic_time(millisecond);
+                    sntp_synchronized ->
+                        yun_net:mark_synced(),
+                        io:format("clock synchronized: ~p\n", [erlang:system_time(second)]),
+                        LastActivity
+                after ?SLICE_MS ->
+                    LastActivity
                 end,
-            case gen_tcp:accept(ListenSock, ?SLICE_MS) of
-                {ok, Sock} ->
-                    _ = handle(Sock, Html, Battery),
-                    gen_tcp:close(Sock),
-                    accept_loop(
-                        ListenSock,
-                        Html,
-                        Battery,
-                        InactivityMs,
-                        Tick,
-                        erlang:monotonic_time(millisecond),
-                        Deadline
-                    );
-                {error, timeout} ->
-                    accept_loop(
-                        ListenSock, Html, Battery, InactivityMs, Tick, LastActivity1, Deadline
-                    );
-                {error, Reason} ->
-                    io:format("http accept failed: ~p\n", [Reason]),
-                    ok
-            end
-    end.
-
-% The SNTP synchronized callback sends to the process that started the
-% network -- which is the one serving here.
-drain_sntp() ->
-    receive
-        sntp_synchronized ->
-            yun_net:mark_synced(),
-            io:format("clock synchronized: ~p\n", [erlang:system_time(second)])
-    after 0 ->
-        ok
+            LastActivity2 =
+                case Tick() of
+                    pressed -> erlang:monotonic_time(millisecond);
+                    idle -> LastActivity1
+                end,
+            main_loop(InactivityMs, Tick, LastActivity2, Deadline)
     end.
 
 handle(Sock, Html, Battery) ->

@@ -40,7 +40,7 @@ start() ->
 % absolute.
 dark_wake() ->
     m5:begin_([{clear_display, false}]),
-    m5_display:sleep(),
+    display_off(),
     Loaded = yun_sampler:ensure_loaded(),
     io:format("sampler: ~p, count: ~p\n", [Loaded, yun_sampler:sample_count()]),
     harvest_if_due(),
@@ -130,7 +130,7 @@ interactive_wake() ->
             io:format("wifi failed: ~p\n", [Error]),
             timer:sleep(?DISPLAY_TIMEOUT_MS)
     end,
-    m5_display:sleep(),
+    display_off(),
     go_to_sleep().
 
 go_to_sleep() ->
@@ -238,7 +238,7 @@ serve_tick(Reading0, Url) ->
         OffAt ->
             case erlang:monotonic_time(millisecond) >= OffAt of
                 true ->
-                    m5_display:sleep(),
+                    display_off(),
                     put(display_off_at, undefined);
                 false ->
                     ok
@@ -248,6 +248,12 @@ serve_tick(Reading0, Url) ->
         true -> pressed;
         false -> idle
     end.
+
+% Panel sleep alone leaves the AXP192-driven backlight lit on the
+% StickC Plus; cut the brightness too or the screen stays visibly on.
+display_off() ->
+    m5_display:set_brightness(0),
+    m5_display:sleep().
 
 % The red LED (active low) is not an indicator of anything -- turn it
 % off and hold the pin through deep sleep (GPIO10 is not an RTC pad and
