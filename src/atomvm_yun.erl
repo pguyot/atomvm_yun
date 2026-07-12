@@ -41,11 +41,24 @@ start() ->
 dark_wake() ->
     m5:begin_([{clear_display, false}]),
     display_off(),
-    Loaded = yun_sampler:ensure_loaded(),
+    Loaded = ensure_sampler(),
     io:format("sampler: ~p, count: ~p\n", [Loaded, yun_sampler:sample_count()]),
     harvest_if_due(),
     maybe_sync_clock(),
     go_to_sleep().
+
+% Load the sampler if needed; a fresh load resets the ULP sample_count
+% to 0, so the NVS harvest cursor (which counts against it) must reset
+% too, else the next harvest sees a huge wrapped delta and records a
+% ring full of stale/zero samples.
+ensure_sampler() ->
+    case yun_sampler:ensure_loaded() of
+        loaded ->
+            esp:nvs_put_binary(?NVS_NS, ?NVS_HARVEST_COUNT, <<0:16/little>>),
+            loaded;
+        already_loaded ->
+            already_loaded
+    end.
 
 maybe_sync_clock() ->
     case yun_net:provisioned() andalso yun_net:sync_due() of
@@ -85,7 +98,7 @@ interactive_wake() ->
             ok
     end,
 
-    Loaded = yun_sampler:ensure_loaded(),
+    Loaded = ensure_sampler(),
     io:format("sampler: ~p, count: ~p\n", [Loaded, yun_sampler:sample_count()]),
 
     % First contact fenced from the ULP sampler; also logs which hat
@@ -255,14 +268,13 @@ display_off() ->
     m5_display:set_brightness(0),
     m5_display:sleep().
 
-% The red LED (active low) is not an indicator of anything -- turn it
-% off and hold the pin through deep sleep (GPIO10 is not an RTC pad and
-% would float back to glowing).
+% The red LED (active low) is not an indicator of anything -- drive it
+% off. NOT held through deep sleep: gpio:deep_sleep_hold_en() freezes
+% pad state globally, which traps the SDA/SCL lines the ULP sampler
+% drives during deep sleep (arbitration lost -> sensor errors).
 led_off() ->
     gpio:set_pin_mode(?GPIO_LED, output),
-    gpio:digital_write(?GPIO_LED, high),
-    gpio:hold_en(?GPIO_LED),
-    gpio:deep_sleep_hold_en().
+    gpio:digital_write(?GPIO_LED, high).
 
 nvs_harvest_count() ->
     case esp:nvs_get_binary(?NVS_NS, ?NVS_HARVEST_COUNT) of
