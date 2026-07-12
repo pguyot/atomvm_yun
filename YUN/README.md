@@ -53,20 +53,35 @@ cmake --build build     # produces build/yun.bin, prints size (must fit 16 KB)
 
 ## Flash
 
-```sh
-st-flash --reset write build/yun.bin 0x08000000
-```
-
 Once the low-power firmware is running, the chip is usually in Stop mode and
-SWD needs a reset to attach — either flash within the 3 s boot grace period or
-use:
+SWD cannot attach without a hardware reset (`DBG_STOP` is not set). The
+aluminum ST-Link V2 clone does **not** drive its RST pin for SWD, so
+`--connect-under-reset` silently degrades ("NRST is not connected") and the
+only option there is catching the 3 s boot grace window after a power-on
+reset — note that the probe back-powers the chip through SWDIO, so pulling
+3V3 alone does *not* reset it; ground NRST (pad 4) briefly instead.
+
+The reliable setup is a Raspberry Pi Pico flashed with
+[debugprobe](https://github.com/raspberrypi/debugprobe) (CMSIS-DAP), which
+drives NRST properly. Wiring (Pico physical pin → hat pad, pads counted from
+the square one): 2 (GP1)→4 NRST, 3 (GND)→5 GND, 4 (GP2)→2 SWCLK,
+5 (GP3)→3 SWDIO, 36 (3V3 OUT)→1 3V3. One power source only: never wire the
+probe's 3V3 while the hat sits on the stick.
 
 ```sh
-st-flash --connect-under-reset --reset write build/yun.bin 0x08000000
+openocd -f interface/cmsis-dap.cfg -c "transport select swd" \
+    -f target/stm32f0x.cfg -c "adapter speed 1000" \
+    -c "reset_config srst_only srst_nogate connect_assert_srst" \
+    -c "init" -c "reset halt" \
+    -c "program build/yun.bin 0x08000000 verify" \
+    -c "reset run" -c "shutdown"
 ```
+
+This attaches even to a sleeping chip. `st-flash --reset write
+build/yun.bin 0x08000000` still works with the ST-Link when the firmware
+is awake (factory firmware, or within the boot grace period).
 
 ## Restore factory firmware
 
-```sh
-st-flash --connect-under-reset --reset write yun_factory_backup.bin 0x08000000
-```
+Same OpenOCD command with `yun_factory_backup.bin` in place of
+`build/yun.bin`.
