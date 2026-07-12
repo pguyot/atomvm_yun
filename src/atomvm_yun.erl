@@ -37,7 +37,8 @@ start() ->
 dark_wake() ->
     m5:begin_([{clear_display, false}]),
     m5_display:sleep(),
-    _ = yun_sampler:ensure_loaded(),
+    Loaded = yun_sampler:ensure_loaded(),
+    io:format("sampler: ~p, count: ~p\n", [Loaded, yun_sampler:sample_count()]),
     harvest_if_due(),
     maybe_sync_clock(),
     go_to_sleep().
@@ -128,14 +129,17 @@ interactive_wake() ->
     go_to_sleep().
 
 go_to_sleep() ->
-    % Both are needed for the sampler to live through deep sleep: the
-    % ULP wakeup trigger keeps the FSM timer clocked (and its memory
-    % considered in use), and the pd override pins RTC slow memory on.
-    % Timer runs never execute WAKE (only wake_request ones do), so the
-    % trigger does not cause spurious CPU wakes.
+    % The ULP wakeup trigger keeps the FSM timer clocked through deep
+    % sleep (and its memory considered in use); the pd override pins RTC
+    % slow memory on as well. Timer runs never execute WAKE (only
+    % wake_request ones do), so the trigger causes no spurious CPU
+    % wakes. The button must use EXT1: on the ESP32, EXT0 cannot be
+    % combined with the ULP wakeup source (this fails, and a crashed
+    % main process ends in an unconfigured sleep that kills the
+    % sampler). EXT1 mode 0 = wake when all masked pins are low.
     ok = esp:sleep_enable_ulp_wakeup(),
     ok = ulp:keep_memory_in_deep_sleep(),
-    ok = esp:sleep_enable_ext0_wakeup(?GPIO_BTN_A, 0),
+    ok = esp:sleep_enable_ext1_wakeup(1 bsl ?GPIO_BTN_A, 0),
     esp:deep_sleep(ms_until_harvest()).
 
 % Move complete batches from the sampler ring to the flash log. Runs on
