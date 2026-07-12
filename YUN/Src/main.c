@@ -37,7 +37,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define YUN_FW_VERSION    0x01  /* read back with command 0xFE; factory firmware NACKs it */
+#define YUN_FW_VERSION    0x02  /* read back with command 0xFE; factory firmware NACKs it */
 
 #define CMD_READ_LIGHT    0x00
 #define CMD_SET_LED       0x01
@@ -46,6 +46,18 @@
 
 #define AWAKE_TIMEOUT_MS  500   /* auto-Stop after this much I2C inactivity */
 #define BOOT_GRACE_MS     3000  /* stay awake after reset so SWD attach is easy */
+
+/* Give up waiting for a quiet bus on wake after this long (an SHT20
+   hold-master measurement can stretch SCL for up to ~85 ms). */
+#define BUS_IDLE_WAIT_MS  100
+/* SCL and SDA must read high this many consecutive polls (~a few hundred
+   microseconds at 64 MHz) to count as an idle bus, so a gap between clock
+   pulses of an ongoing transaction doesn't qualify. */
+#define BUS_IDLE_POLLS    1000
+/* BUSY set with no address match for this long means the flag latched
+   spuriously (errata DM00091791) -> recover with a PE toggle. Must stay
+   above the SHT20's worst-case ~85 ms clock stretch. */
+#define BUSY_STUCK_MS     200
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -82,6 +94,42 @@ extern ADC_HandleTypeDef hadc;
 void i2c1_addr_req_callback(uint8_t TransferDirection) {
   UNUSED(TransferDirection);
   last_activity = HAL_GetTick();
+}
+
+/* Block until SCL and SDA both read high for BUS_IDLE_POLLS consecutive
+   polls, or BUS_IDLE_WAIT_MS elapsed. Enabling the I2C peripheral in the
+   middle of another master's transaction can latch BUSY spuriously
+   (errata DM00091791), and we wake on the very edges of such traffic. */
+static void wait_bus_idle(void)
+{
+  uint32_t start = HAL_GetTick();
+  uint32_t high_polls = 0;
+  while (high_polls < BUS_IDLE_POLLS
+      && (HAL_GetTick() - start) < BUS_IDLE_WAIT_MS) {
+    if ((GPIOA->IDR & (GPIO_PIN_9 | GPIO_PIN_10))
+        == (GPIO_PIN_9 | GPIO_PIN_10)) {
+      high_polls++;
+    }
+    else {
+      high_polls = 0;
+    }
+  }
+}
+
+/* Recover from a spuriously latched BUSY flag: toggle PE (errata
+   DM00091791) and re-arm the slave state machine from scratch. */
+static void i2c_bus_recover(void)
+{
+  HAL_I2C_DisableListen_IT(&hi2c1);
+  __HAL_I2C_DISABLE(&hi2c1);
+  /* PE must stay low for at least 3 APB clock cycles */
+  for (volatile uint32_t i = 0; i < 16; i++) { }
+  wait_bus_idle();
+  __HAL_I2C_ENABLE(&hi2c1);
+  hi2c1.State = HAL_I2C_STATE_READY;
+  hi2c1.Mode = HAL_I2C_MODE_NONE;
+  hi2c1.ErrorCode = HAL_I2C_ERROR_NONE;
+  HAL_I2C_EnableListen_IT(&hi2c1);
 }
 
 static void enter_stop_mode(void)
@@ -121,6 +169,10 @@ static void enter_stop_mode(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* We were woken by a START edge, quite possibly of a transaction for
+     the SHT20/BMP280: let it finish before enabling our I2C. */
+  wait_bus_idle();
 
   __HAL_I2C_ENABLE(&hi2c1);
   HAL_I2C_EnableListen_IT(&hi2c1);
@@ -211,14 +263,32 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   last_activity = HAL_GetTick();
+  uint32_t busy_start = last_activity;
   while (1)
   {
-    if ((sleep_request || (HAL_GetTick() - last_activity) >= awake_timeout)
-        && !(hi2c1.Instance->ISR & I2C_ISR_BUSY)) {
+    uint32_t now = HAL_GetTick();
+    uint8_t busy = (hi2c1.Instance->ISR & I2C_ISR_BUSY) != 0;
+
+    if (!busy) {
+      busy_start = now;
+    }
+    else if ((now - busy_start) >= BUSY_STUCK_MS
+        && (now - last_activity) >= BUSY_STUCK_MS) {
+      /* BUSY held with no address match for far longer than any real
+         transaction (incl. SHT20 clock stretch): the flag latched
+         spuriously. Left alone we would NACK everything and never
+         sleep -- and holding SDA low traps the ESP32 in download mode
+         at its next reset (SDA is its boot-strapping pin). */
+      i2c_bus_recover();
+      busy_start = HAL_GetTick();
+    }
+
+    if ((sleep_request || (now - last_activity) >= awake_timeout) && !busy) {
       /* The BUSY check keeps us from killing a transaction in flight; a
          START that sneaks in after it is missed once and the master retries,
          same as any transaction that arrives while asleep. */
       enter_stop_mode();
+      busy_start = HAL_GetTick();
     }
     else {
       __WFI(); /* Sleep (not Stop) until the next interrupt while awake */

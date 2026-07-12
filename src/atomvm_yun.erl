@@ -13,7 +13,7 @@
 -define(GPIO_BTN_A, 37).
 
 % How long the reading stays on screen before going back to deep sleep
--define(DISPLAY_TIMEOUT_MS, 20000).
+-define(DISPLAY_TIMEOUT_MS, 3000).
 
 % Thermometer: wakes on BtnA, reads the SHT20 through the ULP, shows the
 % temperature big with a battery gauge top-right, then deep-sleeps again.
