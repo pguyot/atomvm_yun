@@ -197,12 +197,14 @@ nvs_harvest_count() ->
     end.
 
 % Sleep until a full batch is pending (self-aligning to the sampler's
-% cadence), with a small margin so the batch is complete when we wake.
+% cadence). The margin only covers the sample's own duration: the deep
+% sleep timer and the ULP wake timer share the RTC slow clock, so their
+% drift cancels.
 ms_until_harvest() ->
     Pending = (yun_sampler:sample_count() - nvs_harvest_count()) band 16#FFFF,
     Missing = max(?HARVEST_BATCH - Pending, 0),
     PeriodMs = yun_sampler:sample_period_us() div 1000,
-    max(Missing * PeriodMs + 20000, 60000).
+    max(Missing * PeriodMs + 3000, 60000).
 
 % Tenths of a degree Celsius from the raw SHT20 sample.
 raw_to_tenths(Raw) ->
