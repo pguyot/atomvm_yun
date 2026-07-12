@@ -164,7 +164,9 @@ data_json(Battery) ->
         <<",\"period_s\":">>,
         integer_to_binary(yun_sampler:sample_period_us() div 1000000),
         <<",\"battery\":">>,
-        integer_to_binary(Battery),
+        battery_json(Battery),
+        <<",\"charging\":">>,
+        charging_json(Battery),
         <<",\"temp_mc\":">>,
         Current,
         <<",\"records\":[">>,
@@ -177,8 +179,19 @@ record_json(#{timestamp := Ts, battery := B, samples := Samples}) ->
         <<"{\"t\":">>,
         integer_to_binary(Ts),
         <<",\"b\":">>,
-        integer_to_binary(B),
+        battery_json(B),
+        <<",\"c\":">>,
+        charging_json(B),
         <<",\"s\":[">>,
         lists:join(<<",">>, [integer_to_binary(S) || S <- Samples]),
         <<"]}">>
     ].
+
+% Battery byte: level in the low 7 bits, charging flag in bit 7,
+% 16#FF = unknown.
+battery_json(16#FF) -> <<"null">>;
+battery_json(B) -> integer_to_binary(B band 16#7F).
+
+charging_json(16#FF) -> <<"false">>;
+charging_json(B) when B band 16#80 =/= 0 -> <<"true">>;
+charging_json(_) -> <<"false">>.

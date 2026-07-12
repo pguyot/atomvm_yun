@@ -118,12 +118,7 @@ interactive_wake() ->
                 timer:sleep(15000),
                 m5_display:sleep()
             end),
-            BatteryByte =
-                case Battery of
-                    L when is_integer(L), L >= 0, L =< 100 -> L;
-                    _ -> 16#FF
-                end,
-            yun_http:serve(BatteryByte, 90000),
+            yun_http:serve(battery_byte(), 90000),
             yun_net:down();
         {error, not_provisioned} ->
             timer:sleep(?DISPLAY_TIMEOUT_MS);
@@ -156,11 +151,7 @@ harvest_if_due() ->
     {Count, Samples} = yun_sampler:harvest(Last),
     case length(Samples) >= ?HARVEST_BATCH of
         true ->
-            Battery =
-                case m5_power:get_battery_level() of
-                    L when is_integer(L), L >= 0, L =< 100 -> L;
-                    _ -> 16#FF
-                end,
+            Battery = battery_byte(),
             Now = erlang:system_time(second),
             Ts =
                 case Now >= ?PLAUSIBLE_TIME of
@@ -194,6 +185,25 @@ append_batches(Samples, Ts, Battery) ->
             append_batches(Rest, Ts, Battery);
         false ->
             ok = yun_log:append(Ts, Battery, Samples)
+    end.
+
+% Battery level (0..100) in the low 7 bits, charging flag in bit 7;
+% 16#FF = unknown. Charging matters to the log because the charger
+% warms the board and skews the SHT20 readings.
+battery_byte() ->
+    Level =
+        case m5_power:get_battery_level() of
+            L when is_integer(L), L >= 0, L =< 100 -> L;
+            _ -> undefined
+        end,
+    case Level of
+        undefined ->
+            16#FF;
+        _ ->
+            case m5_power:is_charging() of
+                is_charging -> Level bor 16#80;
+                _ -> Level
+            end
     end.
 
 nvs_harvest_count() ->

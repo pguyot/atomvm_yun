@@ -7,12 +7,14 @@
 <style>
   :root {
     --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8984;
-    --series: #2a78d6; --grid: #e8e7e3; --chip: #f1f0ec;
+    --series: #2a78d6; --series2: #1baf7a; --grid: #e8e7e3; --chip: #f1f0ec;
+    --charge: rgba(237, 161, 0, 0.16);
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #7f7e76;
-      --series: #3987e5; --grid: #33322f; --chip: #262624;
+      --series: #3987e5; --series2: #199e70; --grid: #33322f; --chip: #262624;
+      --charge: rgba(201, 133, 0, 0.22);
     }
   }
   * { box-sizing: border-box; margin: 0; }
@@ -42,6 +44,9 @@
          color: var(--surface); border-radius: 6px; padding: 3px 8px;
          font-size: 13px; display: none; white-space: nowrap; transform: translate(-50%, -130%); }
   svg { display: block; width: 100%; height: auto; }
+  .caption { color: var(--ink-3); font-size: 12px; margin: 10px 0 2px; }
+  .caption .swatch { display: inline-block; width: 14px; height: 10px;
+    background: var(--charge); vertical-align: -1px; border-radius: 2px; }
   details { margin-top: 18px; color: var(--ink-2); font-size: 14px; }
   table { border-collapse: collapse; width: 100%; margin-top: 8px; }
   td, th { text-align: left; padding: 3px 8px 3px 0; border-bottom: 1px solid var(--grid); }
@@ -64,6 +69,8 @@
   <svg id="chart" viewBox="0 0 640 300" role="img" aria-label="temperature over time"></svg>
   <div id="tip"></div>
 </div>
+<div class="caption">battery <span class="swatch"></span> shaded spans: charging (readings run warm)</div>
+<svg id="batchart" viewBox="0 0 640 120" role="img" aria-label="battery level over time"></svg>
 <div id="status"></div>
 <details><summary>Data table</summary><div id="table"></div></details>
 <script>
@@ -79,23 +86,46 @@ const fmtT = t => {
          d.toLocaleTimeString(undefined, {hour: "2-digit", minute: "2-digit"});
 };
 
+let batPts = [], chargeSpans = [];
+
 function flatten(d) {
   // records: oldest first; each has t (unix of newest sample, 0 = clock
-  // unsynced), samples oldest first, spaced period_s
+  // unsynced), samples oldest first, spaced period_s; b = battery %,
+  // c = charging during that hour
   const pts = [];
+  batPts = []; chargeSpans = [];
   for (const r of d.records) {
     if (!r.t) continue;
     r.s.forEach((raw, i) => {
       const t = r.t - (r.s.length - 1 - i) * d.period_s;
       pts.push({t, v: raw >= 0xFFF0 ? null : mc(raw)});
     });
+    if (r.b !== null) batPts.push({t: r.t, v: r.b});
+    if (r.c) {
+      const t0 = r.t - (r.s.length - 1) * d.period_s;
+      const last = chargeSpans[chargeSpans.length - 1];
+      if (last && t0 - last.t1 < d.period_s * 2) last.t1 = r.t;
+      else chargeSpans.push({t0, t1: r.t});
+    }
   }
   return pts.sort((a, b) => a.t - b.t);
 }
 
+function bandRects(x, T, H, B, t0, t1) {
+  let g = "";
+  for (const sp of chargeSpans) {
+    const a = Math.max(sp.t0, t0), b = Math.min(sp.t1, t1);
+    if (b <= a) continue;
+    g += `<rect x="${x(a).toFixed(1)}" y="${T}" width="${(x(b)-x(a)).toFixed(1)}" height="${H-T-B}" fill="var(--charge)"/>`;
+  }
+  return g;
+}
+
 function render() {
   if (!data) return;
-  $("battery").textContent = data.battery <= 100 ? data.battery + "%" : "--%";
+  $("battery").textContent =
+    (data.battery === null ? "--%" : data.battery + "%") +
+    (data.charging ? " ⚡" : "");
   $("temp").textContent = data.temp_mc === null ? "--.-" : (data.temp_mc / 1000).toFixed(1);
   if (document.activeElement !== $("name")) $("name").value = data.name;
   const age = Math.round(Date.now() / 1000 - data.fetched_at);
@@ -104,6 +134,7 @@ function render() {
     "updated " + fmtT(data.fetched_at);
   points = flatten(data);
   drawChart();
+  drawBatChart();
   drawTable();
 }
 
@@ -133,6 +164,7 @@ function drawChart() {
     const anchor = i === 0 ? "start" : i === 3 ? "end" : "middle";
     g += `<text x="${x(t)}" y="${H-8}" text-anchor="${anchor}" fill="var(--ink-3)" font-size="12">${fmtT(t)}</text>`;
   }
+  g = bandRects(x, T, H, B, t0, t1) + g;
   // the line, broken at nulls (sensor errors leave gaps, not lies)
   let dstr = "", pen = false;
   for (const p of pts) {
@@ -150,6 +182,29 @@ function drawChart() {
 }
 const cross = () => $("chart").querySelector("#cross");
 const dot = () => $("chart").querySelector("#dot");
+
+// Battery small multiple: same time window as the main chart, fixed
+// 0-100 scale, one point per hourly record.
+function drawBatChart() {
+  const svg = $("batchart"), W = 640, H = 120, L = 42, R = 8, T = 8, B = 18;
+  const cut = (data.fetched_at || Date.now() / 1000) - hours * 3600;
+  const pts = batPts.filter(p => p.t >= cut);
+  if (pts.length < 2) { svg.innerHTML =
+    `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="var(--ink-3)" font-size="13">battery history appears after a few harvests</text>`;
+    return; }
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  const x = t => L + (W - L - R) * (t - t0) / (t1 - t0 || 1);
+  const y = v => T + (H - T - B) * (1 - v / 100);
+  let g = bandRects(x, T, H, B, t0, t1);
+  for (const v of [0, 50, 100]) {
+    g += `<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)" stroke-width="1"/>`;
+    g += `<text x="${L-6}" y="${y(v)+4}" text-anchor="end" fill="var(--ink-3)" font-size="11">${v}</text>`;
+  }
+  let dstr = "";
+  pts.forEach((p, i) => { dstr += (i ? "L" : "M") + x(p.t).toFixed(1) + " " + y(p.v).toFixed(1); });
+  g += `<path d="${dstr}" fill="none" stroke="var(--series2)" stroke-width="2" stroke-linejoin="round"/>`;
+  svg.innerHTML = g;
+}
 
 function niceStep(raw) {
   const p = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -242,6 +297,7 @@ for (const b of document.querySelectorAll(".filters button")) {
     b.setAttribute("aria-pressed", "true");
     hours = +b.dataset.h;
     drawChart();
+    drawBatChart();
   };
 }
 
