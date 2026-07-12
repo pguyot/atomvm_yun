@@ -1,0 +1,8 @@
+[{<<"atomvm_m5">>,
+  {git,"https://github.com/pguyot/atomvm_m5.git",
+       {ref,"11bf869421649674482878317370e752815e72f3"}},
+  0},
+ {<<"atomvm_ulp">>,
+  {git,"https://github.com/pguyot/atomvm_ulp.git",
+       {ref,"84c70307059afd9d1b51634b5d793e962bdc51f3"}},
+  0}].

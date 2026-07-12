@@ -24,7 +24,7 @@ void color_set_single(uint32_t color);
   gpio_low(); \
   delay_600ns();
 
-inline void restart() {
+static inline void restart() {
   for (uint8_t i = 0; i < 113; i++) {
     delay_600ns();
   }

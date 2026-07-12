@@ -174,5 +174,15 @@ void I2C1_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
+/**
+  * @brief This function handles EXTI lines 4 to 15 interrupts.
+  *        Only armed while in Stop mode, on PA10 (SDA falling edge = START
+  *        condition); its sole job is to wake the core.
+  */
+void EXTI4_15_IRQHandler(void)
+{
+  __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_10);
+}
+
 /* USER CODE END 1 */
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/

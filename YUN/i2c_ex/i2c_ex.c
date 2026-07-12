@@ -12,7 +12,7 @@ __IO uint8_t rx_buffer[I2C_RECEIVE_BUFFER_LEN];
 __IO uint8_t tx_buffer[I2C_RECEIVE_BUFFER_LEN];
 __IO uint16_t tx_len = 0;
 __IO uint8_t tx_state = 0;
-I2C_HandleTypeDef hi2c1;
+extern I2C_HandleTypeDef hi2c1; /* defined in Src/i2c.c */
 
 __weak void i2c1_receive_callback(uint8_t *rx_data, uint16_t len) {
 	/* Prevent unused argument(s) compilation warning */
