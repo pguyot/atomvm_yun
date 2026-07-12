@@ -1,6 +1,6 @@
 -module(atomvm_yun).
 
--export([start/0]).
+-export([start/0, test_yun_hat/0]).
 
 -include_lib("atomvm_ulp/include/ulp.hrl").
 
@@ -9,6 +9,14 @@
 -define(RTC_GPIO_SHT20_I2C_SCL, 7).
 -define(RTC_GPIO_SHT20_I2C_SDA, 11).
 
+% BtnA on the M5StickC Plus, active low, RTC-capable (deep sleep wake)
+-define(GPIO_BTN_A, 37).
+
+% How long the reading stays on screen before going back to deep sleep
+-define(DISPLAY_TIMEOUT_MS, 20000).
+
+% Thermometer: wakes on BtnA, reads the SHT20 through the ULP, shows the
+% temperature big with a battery gauge top-right, then deep-sleeps again.
 start() ->
     m5:begin_([{clear_display, true}]),
     m5_display:set_epd_mode(fastest),
@@ -22,44 +30,81 @@ start() ->
             ok
     end,
 
-    TextSize0 = floor(m5_display:height() / 160),
-    TextSize = max(1, TextSize0),
-    m5_display:set_text_size(TextSize),
+    io:format("wakeup cause: ~p\n", [esp:sleep_get_wakeup_cause()]),
 
-    Name = atom_to_list(m5:get_board()),
+    Battery = m5_power:get_battery_level(),
+    Reading =
+        try measure_temperature() of
+            Raw when Raw >= 16#FFF0 -> {error, Raw};
+            Raw -> {ok, Raw}
+        catch
+            exit:timeout -> {error, timeout}
+        end,
+    io:format("battery: ~p, reading: ~p\n", [Battery, Reading]),
+    draw_ui(Reading, Battery),
+
+    timer:sleep(?DISPLAY_TIMEOUT_MS),
+    m5_display:sleep(),
+    ok = esp:sleep_enable_ext0_wakeup(?GPIO_BTN_A, 0),
+    esp:deep_sleep().
+
+% SHT20: T = -46.85 + 175.72 * S / 2^16, with the 2 status bits cleared.
+% Returns tenths of a degree Celsius as an integer.
+raw_to_tenths(Raw) ->
+    round(((175.72 * (Raw band 16#FFFC)) / 65536 - 46.85) * 10).
+
+draw_ui({ok, Raw}, Battery) ->
+    Tenths = raw_to_tenths(Raw),
+    Str = list_to_binary(
+        io_lib:format("~B.~B", [Tenths div 10, abs(Tenths rem 10)])
+    ),
+    io:format("temperature: ~s C\n", [Str]),
     m5_display:start_write(),
+    m5_display:fill_screen(16#000000),
+    draw_battery(Battery),
+    m5_display:set_text_size(1),
+    m5_display:draw_string(<<"SHT20">>, 8, 8),
+    % 6x8 font at size 6: 36x48 px per character
+    m5_display:set_text_size(6),
+    CharW = 36,
+    DegR = 5,
+    TempW = CharW * byte_size(Str),
+    TotalW = TempW + 2 * DegR + 4 + CharW,
+    X0 = max(0, (m5_display:width() - TotalW) div 2),
+    Y0 = (m5_display:height() - 48) div 2 + 4,
+    m5_display:draw_string(Str, X0, Y0),
+    DegX = X0 + TempW + DegR + 2,
+    m5_display:draw_circle(DegX, Y0 + DegR, DegR, 16#FFFFFF),
+    m5_display:draw_string(<<"C">>, DegX + DegR + 2, Y0),
+    m5_display:end_write();
+draw_ui({error, Reason}, Battery) ->
+    io:format("measurement failed: ~p\n", [Reason]),
+    m5_display:start_write(),
+    m5_display:fill_screen(16#000000),
+    draw_battery(Battery),
+    m5_display:set_text_size(2),
+    m5_display:draw_string(<<"sensor error">>, 30, 60),
+    m5_display:end_write().
 
-    m5_display:print(<<"Core:">>),
-    m5_display:println(Name),
-
-    IMUName = atom_to_list(m5_imu:get_type()),
-    m5_display:print(<<"IMU:">>),
-    m5_display:println(IMUName),
-
-    m5_display:end_write(),
-
-    % Talk to the hat STM32 before the ULP bit-bangs the shared bus: its
-    % traffic wakes the STM32 mid-transaction, which can latch BUSY
-    % (errata DM00091791) until the firmware learns to recover from it.
-    test_yun_hat(),
-
-    try
-        Temperature = measure_temperature(),
-    
-        m5_display:start_write(),
-
-        m5_display:print(<<"Temperature:">>),
-        m5_display:println(integer_to_binary(Temperature)),
-
-        m5_display:end_write()
-    catch exit:timeout ->
-        m5_display:start_write(),
-        m5_display:println(<<"TIMEOUT">>),
-        m5_display:end_write()
-    end,
-
-    timer:sleep(5000),
-    m5_power:deep_sleep(),
+% Battery gauge in the top-right corner: outline + nub, fill colored by
+% level, with the percentage in small text to its left.
+draw_battery(Level) when is_integer(Level), Level >= 0, Level =< 100 ->
+    X = m5_display:width() - 34,
+    Y = 8,
+    m5_display:draw_rect(X, Y, 26, 14, 16#FFFFFF),
+    m5_display:fill_rect(X + 26, Y + 4, 3, 6, 16#FFFFFF),
+    Color =
+        if
+            Level > 50 -> 16#00C853;
+            Level > 20 -> 16#FFD600;
+            true -> 16#FF1744
+        end,
+    FillW = max(1, (22 * Level) div 100),
+    m5_display:fill_rect(X + 2, Y + 2, FillW, 10, Color),
+    m5_display:set_text_size(1),
+    Pct = list_to_binary(io_lib:format("~B%", [Level])),
+    m5_display:draw_string(Pct, X - 4 - 6 * byte_size(Pct), Y + 4);
+draw_battery(_Unknown) ->
     ok.
 
 % Exercise the YUN Hat STM32 running the low-power firmware (YUN/README.md):
@@ -359,14 +404,9 @@ measure_temperature() ->
         {ulp, Ref} ->
             true = ulp:isr_deregister(Handler),
             Mem0 = ulp:read_memory(0),
-            io:format("Mem0 = ~8.16.0B\n", [Mem0]),
-            Val0 = Mem0 band 16#FFFF,
-            Mem1 = ulp:read_memory(1),
-            Val1 = Mem1 band 16#FFFF,
-            io:format("Mem1 = ~8.16.0B\n", [Mem1]),
-            Val = Val0 bsl 16 + Val1,
-            io:format("Val = ~8.16.0B\n", [Val]),
-            Val
+            % read_value[0] = 16-bit raw temperature (or an 16#FFFx error
+            % sentinel), read_value[1] = CRC byte, unchecked for now
+            Mem0 band 16#FFFF
     after 1000 ->
         exit(timeout)
     end.
