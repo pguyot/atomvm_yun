@@ -5,6 +5,9 @@
 % BtnA on the M5StickC Plus, active low, RTC-capable (deep sleep wake)
 -define(GPIO_BTN_A, 37).
 
+% Red LED, active low; nothing initializes it so it glows by default
+-define(GPIO_LED, 10).
+
 % How long the reading stays on screen before going back to deep sleep
 -define(DISPLAY_TIMEOUT_MS, 3000).
 
@@ -23,6 +26,7 @@
 % reading) into the flash log. A BtnA wake additionally shows the
 % temperature big with a battery gauge.
 start() ->
+    led_off(),
     Cause = esp:sleep_get_wakeup_cause(),
     io:format("wakeup cause: ~p\n", [Cause]),
     case Cause of
@@ -205,6 +209,15 @@ battery_byte() ->
                 _ -> Level
             end
     end.
+
+% The red LED (active low) is not an indicator of anything -- turn it
+% off and hold the pin through deep sleep (GPIO10 is not an RTC pad and
+% would float back to glowing).
+led_off() ->
+    gpio:set_pin_mode(?GPIO_LED, output),
+    gpio:digital_write(?GPIO_LED, high),
+    gpio:hold_en(?GPIO_LED),
+    gpio:deep_sleep_hold_en().
 
 nvs_harvest_count() ->
     case esp:nvs_get_binary(?NVS_NS, ?NVS_HARVEST_COUNT) of
