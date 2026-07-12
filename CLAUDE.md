@@ -32,6 +32,21 @@ chip — never delete it.
   it (`?I_WR_RTC_CNTL_ULP_CP_SLP_TIMER_EN(0)` before `?I_HALT`) — and
   the RTC domain (loaded program, timer, pad holds) survives EN-pin
   resets; only a full power-off clears it.
+- **A serial DTR/RTS reset wipes the RTC domain on the StickC** (unlike
+  a plain EN reset) — testing ULP/RTC retention over serial resets
+  destroys the state being tested. Use listen-only captures (open the
+  port, no DTR/RTS dance) and let the device wake itself.
+- On the ESP32, **EXT0 wakeup cannot be combined with the ULP wakeup
+  source** — use EXT1 for buttons (mask `1 bsl Pin`, mode 0 = all low).
+  Deep sleep keeps the sampler alive only with BOTH
+  `esp:sleep_enable_ulp_wakeup()` (FSM timer stays clocked) and
+  `ulp:keep_memory_in_deep_sleep()` (RTC slow memory stays powered).
+- Pad mux: while G0/G26 are RTC-routed (`rtc_gpio:init`) the esp-idf
+  I2C peripheral cannot drive them and vice versa —
+  `yun_sampler:acquire_bus/release_bus` handles the switching plus the
+  ULP fence; never talk to the hat outside that bracket.
+- Provisioning (WiFi credentials + device name into NVS):
+  `tools/provision.sh <port> [name]`. Never commit credentials.
 
 ## Build
 
