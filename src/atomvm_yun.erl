@@ -112,6 +112,12 @@ interactive_wake() ->
             io:format("serving at ~s\n", [Url]),
             m5_display:set_text_size(1),
             m5_display:draw_string(Url, 8, m5_display:height() - 12),
+            % Serving continues in the dark: long enough to read the URL,
+            % then the display sleeps while HTTP stays up.
+            spawn(fun() ->
+                timer:sleep(15000),
+                m5_display:sleep()
+            end),
             BatteryByte =
                 case Battery of
                     L when is_integer(L), L >= 0, L =< 100 -> L;

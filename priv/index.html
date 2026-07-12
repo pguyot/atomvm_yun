@@ -205,15 +205,27 @@ async function fetchData(silent) {
   }
 }
 
+let polling = false;
 async function poll() {
-  // the stick serves ~90 s after a button press; retry patiently
+  // The stick serves ~90 s after a button press, then deep-sleeps to
+  // save battery; don't re-poll a sleeping device (that would keep it
+  // awake forever when it is up). Refresh happens on tab focus or tap.
+  if (polling) return;
+  polling = true;
   for (let i = 0; i < 20; i++) {
-    if (await fetchData(i > 0)) { setTimeout(poll, 60000); return; }
+    if (await fetchData(i > 0)) { polling = false; return; }
     await new Promise(r => setTimeout(r, 3000 + i * 1000));
   }
-  $("status").textContent = "gave up — press the device button, then tap here";
+  polling = false;
+  $("status").textContent = "device asleep — press its button, then tap here";
   $("status").onclick = () => { $("status").onclick = null; poll(); };
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" &&
+      (!data || Date.now() / 1000 - data.fetched_at > 60)) poll();
+});
+$("updated").onclick = () => poll();
 
 $("name").addEventListener("change", async () => {
   const n = $("name").value.trim();

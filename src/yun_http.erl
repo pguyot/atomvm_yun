@@ -19,13 +19,18 @@
 %% @doc Listen on port 80 and serve requests; returns after
 %% InactivityMs without one. Battery is displayed data (measured once
 %% by the caller; it doesn't change meaningfully while serving).
+% Hard ceiling on a serve session, whatever the request pattern: the
+% battery must win over a tab left polling in someone's pocket.
+-define(MAX_SERVE_MS, 600000).
+
 -spec serve(Battery :: 0..255, InactivityMs :: pos_integer()) -> ok.
 serve(Battery, InactivityMs) ->
     case gen_tcp:listen(80, [binary, {active, false}, {reuseaddr, true}]) of
         {ok, ListenSock} ->
             io:format("http listening on 80\n"),
             Html = atomvm:read_priv(atomvm_yun, "index.html"),
-            accept_loop(ListenSock, Html, Battery, InactivityMs),
+            Deadline = erlang:monotonic_time(millisecond) + ?MAX_SERVE_MS,
+            accept_loop(ListenSock, Html, Battery, InactivityMs, Deadline),
             gen_tcp:close(ListenSock),
             ok;
         {error, Reason} ->
@@ -33,18 +38,24 @@ serve(Battery, InactivityMs) ->
             ok
     end.
 
-accept_loop(ListenSock, Html, Battery, InactivityMs) ->
+accept_loop(ListenSock, Html, Battery, InactivityMs, Deadline) ->
     drain_sntp(),
-    case gen_tcp:accept(ListenSock, InactivityMs) of
-        {ok, Sock} ->
-            _ = handle(Sock, Html, Battery),
-            gen_tcp:close(Sock),
-            accept_loop(ListenSock, Html, Battery, InactivityMs);
-        {error, timeout} ->
+    Left = Deadline - erlang:monotonic_time(millisecond),
+    case Left =< 0 of
+        true ->
             ok;
-        {error, Reason} ->
-            io:format("http accept failed: ~p\n", [Reason]),
-            ok
+        false ->
+            case gen_tcp:accept(ListenSock, min(InactivityMs, Left)) of
+                {ok, Sock} ->
+                    _ = handle(Sock, Html, Battery),
+                    gen_tcp:close(Sock),
+                    accept_loop(ListenSock, Html, Battery, InactivityMs, Deadline);
+                {error, timeout} ->
+                    ok;
+                {error, Reason} ->
+                    io:format("http accept failed: ~p\n", [Reason]),
+                    ok
+            end
     end.
 
 % The SNTP synchronized callback sends to the process that started the
