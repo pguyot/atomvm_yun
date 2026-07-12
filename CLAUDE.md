@@ -47,6 +47,13 @@ chip — never delete it.
   ULP fence; never talk to the hat outside that bracket.
 - Provisioning (WiFi credentials + device name into NVS):
   `tools/provision.sh <port> [name]`. Never commit credentials.
+- **Never call `gpio:deep_sleep_hold_en()`** on these devices: it
+  freezes ALL pad states in deep sleep, trapping the ULP sampler's
+  SDA/SCL (G0/G26) low → I2C arbitration lost → 0xFFFF samples →
+  "Sensor Error". The LED is driven off while awake and left alone in
+  deep sleep. Debug tip: the thermolog partition (0x350000) records
+  raw samples; dump it to distinguish a dead sensor (0xFFFF = ULP bus
+  fault, 0x0000 = spurious harvest of an empty ring) from real data.
 
 ## Build
 
