@@ -23,6 +23,7 @@
 serve(Battery, InactivityMs) ->
     case gen_tcp:listen(80, [binary, {active, false}, {reuseaddr, true}]) of
         {ok, ListenSock} ->
+            io:format("http listening on 80\n"),
             Html = atomvm:read_priv(atomvm_yun, "index.html"),
             accept_loop(ListenSock, Html, Battery, InactivityMs),
             gen_tcp:close(ListenSock),
@@ -90,16 +91,52 @@ body_of(Request) ->
 
 reply(Sock, Status, ContentType, Body) ->
     Length = integer_to_binary(iolist_size(Body)),
-    gen_tcp:send(Sock, [
-        <<"HTTP/1.1 ">>,
-        Status,
-        <<"\r\nContent-Type: ">>,
-        ContentType,
-        <<"\r\nContent-Length: ">>,
-        Length,
-        <<"\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n">>,
-        Body
-    ]).
+    send_chunked(
+        Sock,
+        iolist_to_binary([
+            <<"HTTP/1.1 ">>,
+            Status,
+            <<"\r\nContent-Type: ">>,
+            ContentType,
+            <<"\r\nContent-Length: ">>,
+            Length,
+            <<"\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n">>,
+            Body
+        ])
+    ).
+
+% lwip's TCP send buffer is ~5.7 KB and AtomVM's socket layer reports
+% buffer-full as an error instead of retrying (AtomVM PR #2345 fixes
+% this upstream). Send MSS-sized chunks with a pause every few to let
+% the buffer drain, and retry a chunk once on a transient error.
+-define(CHUNK, 1400).
+-define(CHUNKS_PER_PAUSE, 3).
+
+send_chunked(Sock, Bin) ->
+    send_chunked(Sock, Bin, 0).
+
+send_chunked(_Sock, <<>>, _N) ->
+    ok;
+send_chunked(Sock, Bin, N) when N rem ?CHUNKS_PER_PAUSE =:= 0, N > 0 ->
+    timer:sleep(30),
+    send_chunked(Sock, Bin, N + 1);
+send_chunked(Sock, Bin, N) ->
+    {Chunk, Rest} =
+        case Bin of
+            <<C:?CHUNK/binary, R/binary>> -> {C, R};
+            _ -> {Bin, <<>>}
+        end,
+    case gen_tcp:send(Sock, Chunk) of
+        ok ->
+            send_chunked(Sock, Rest, N + 1);
+        {error, Reason} ->
+            io:format("send retry after: ~p\n", [Reason]),
+            timer:sleep(80),
+            case gen_tcp:send(Sock, Chunk) of
+                ok -> send_chunked(Sock, Rest, N + 1);
+                Error -> Error
+            end
+    end.
 
 data_json(Battery) ->
     Current =

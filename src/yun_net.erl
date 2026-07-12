@@ -31,21 +31,30 @@ up() ->
         {Ssid, Psk} when is_binary(Ssid), is_binary(Psk), Ssid =/= <<>> ->
             Self = self(),
             Config = [
-                {sta, [{ssid, Ssid}, {psk, Psk}]},
+                % note: network:wait_for_sta/1,2 must NOT be used here --
+                % it starts the network itself and would collide with
+                % this explicit start; we wait on the got_ip callback.
+                {sta, [
+                    {ssid, Ssid},
+                    {psk, Psk},
+                    {got_ip, fun(IpInfo) -> Self ! {yun_got_ip, IpInfo} end}
+                ]},
                 {sntp, [
                     {host, "pool.ntp.org"},
                     {synchronized, fun(_TimeVal) -> Self ! sntp_synchronized end}
                 ]},
-                {mdns, [{host, name()}]}
+                % both keys: network.erl's type says {host, _} but its
+                % maybe_start_mdns reads `hostname` (bug, fixed upstream)
+                {mdns, [{host, name()}, {hostname, name()}]}
             ],
             case network:start(Config) of
                 {ok, _Pid} ->
-                    case network:wait_for_sta(30000) of
-                        {ok, {Address, _Netmask, _Gateway}} ->
-                            {ok, Address};
-                        Error ->
-                            network:stop(),
-                            Error
+                    receive
+                        {yun_got_ip, {Address, _Netmask, _Gateway}} ->
+                            {ok, Address}
+                    after 30000 ->
+                        network:stop(),
+                        {error, association_timeout}
                     end;
                 Error ->
                     Error
