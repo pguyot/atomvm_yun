@@ -26,7 +26,6 @@
 % reading) into the flash log. A BtnA wake additionally shows the
 % temperature big with a battery gauge.
 start() ->
-    led_off(),
     Cause = esp:sleep_get_wakeup_cause(),
     io:format("wakeup cause: ~p\n", [Cause]),
     case Cause of
@@ -40,6 +39,8 @@ start() ->
 % absolute.
 dark_wake() ->
     m5:begin_([{clear_display, false}]),
+    % After begin_ (which reconfigures GPIO10) so it takes effect.
+    led_off(),
     display_off(),
     Loaded = ensure_sampler(),
     io:format("sampler: ~p, count: ~p\n", [Loaded, yun_sampler:sample_count()]),
@@ -84,6 +85,8 @@ maybe_sync_clock() ->
 
 interactive_wake() ->
     m5:begin_([{clear_display, true}]),
+    % After begin_ (which reconfigures GPIO10) so it takes effect.
+    led_off(),
     % The previous wake may have been a dark one that put the panel to
     % sleep; begin_ alone does not always bring it back.
     m5_display:wakeup(),
@@ -109,13 +112,14 @@ interactive_wake() ->
     ok = yun_sampler:release_bus(),
 
     Battery = m5_power:get_battery_level(),
-    % Display the ring's latest sample (<= 5 min old) rather than forcing
-    % a manual one: manual samples would pollute the log's 5-min cadence.
-    % Only a cold boot with an empty ring waits for a fresh sample.
+    % Show the newest VALID sample from the ULP ring (a few minutes old
+    % at worst), so a single failed deep-sleep sample doesn't surface as
+    % a sensor error. Only an entirely empty/failed ring (cold boot)
+    % forces a fresh sample.
     Reading =
-        case yun_sampler:latest() of
-            {error, no_sample_yet} -> yun_sampler:sample_now(3000);
-            Latest -> Latest
+        case yun_sampler:latest_valid() of
+            {ok, _} = Ok -> Ok;
+            {error, no_valid_sample} -> yun_sampler:sample_now(3000)
         end,
     io:format("battery: ~p, reading: ~p\n", [Battery, Reading]),
     draw_ui(Reading, Battery),

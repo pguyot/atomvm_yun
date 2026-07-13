@@ -26,6 +26,7 @@
     ensure_loaded/0,
     sample_now/1,
     latest/0,
+    latest_valid/0,
     harvest/1,
     sample_count/0,
     acquire_bus/0,
@@ -58,7 +59,7 @@
 
 % "YU" + layout revision; bump when the program or layout changes so a
 % stale resident program is replaced at the next cold boot.
--define(MAGIC, 16#59550003).
+-define(MAGIC, 16#59550005).
 
 % Error sentinels (must stay >= 16#FFF0)
 -define(ERR_ADDR_W_NACK, 16#FFFE).
@@ -117,6 +118,24 @@ latest() ->
         Err when Err >= 16#FFF0 -> {error, Err};
         0 -> {error, no_sample_yet};
         Raw -> {ok, Raw}
+    end.
+
+%% @doc Newest valid sample in the ring, scanning back from the write
+%% pointer past any failed (>= 16#FFF0) or empty (0) slots. A thermometer
+%% reading a few minutes old is fine; a single failed deep-sleep sample
+%% should never surface as an error when good history is one slot back.
+-spec latest_valid() -> {ok, Raw :: non_neg_integer()} | {error, no_valid_sample}.
+latest_valid() ->
+    WI = ulp:read_memory(?OFF_WRITE_INDEX) band ?RING_MASK,
+    latest_valid(WI, ?RING_SIZE).
+
+latest_valid(_WI, 0) ->
+    {error, no_valid_sample};
+latest_valid(WI, N) ->
+    Idx = (WI - 1) band ?RING_MASK,
+    case ulp:read_memory(?OFF_RING + Idx) band 16#FFFF of
+        Raw when Raw > 0, Raw < 16#FFF0 -> {ok, Raw};
+        _ -> latest_valid(Idx, N - 1)
     end.
 
 %% ULP ST stores the program counter in the word's upper bits, so every
