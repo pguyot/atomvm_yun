@@ -59,7 +59,7 @@
 
 % "YU" + layout revision; bump when the program or layout changes so a
 % stale resident program is replaced at the next cold boot.
--define(MAGIC, 16#59550005).
+-define(MAGIC, 16#59550007).
 
 % Error sentinels (must stay >= 16#FFF0)
 -define(ERR_ADDR_W_NACK, 16#FFFE).

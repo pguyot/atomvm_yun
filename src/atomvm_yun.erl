@@ -28,11 +28,30 @@
 start() ->
     Cause = esp:sleep_get_wakeup_cause(),
     io:format("wakeup cause: ~p\n", [Cause]),
-    case Cause of
-        sleep_wakeup_timer -> dark_wake();
-        sleep_wakeup_ulp -> dark_wake();
-        _ -> interactive_wake()
+    try
+        case Cause of
+            sleep_wakeup_timer -> dark_wake();
+            sleep_wakeup_ulp -> dark_wake();
+            _ -> interactive_wake()
+        end
+    catch
+        Class:Reason:Stack ->
+            % A field thermometer must never hot-boot-loop on an
+            % exception (it blinks and drains the battery, and AtomVM's
+            % crash reporter can itself double-fault). Log and deep-sleep
+            % so a transient fault recovers on the next wake.
+            io:format("FATAL ~p:~p\n~p\n", [Class, Reason, Stack]),
+            safe_sleep()
     end.
+
+% Minimal, exception-proof path to deep sleep: keep the sampler alive,
+% arm the button and a 1-minute retry timer, and sleep. Every step is
+% guarded so nothing here can re-raise into a loop.
+safe_sleep() ->
+    catch esp:sleep_enable_ulp_wakeup(),
+    catch ulp:keep_memory_in_deep_sleep(),
+    catch esp:sleep_enable_ext1_wakeup(1 bsl ?GPIO_BTN_A, 0),
+    esp:deep_sleep(60000).
 
 % Hourly harvest: no display, minimal time awake. Once a day (or until
 % first success) the clock is SNTP-synchronized so log timestamps are

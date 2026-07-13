@@ -47,6 +47,18 @@ chip — never delete it.
   ULP fence; never talk to the hat outside that bracket.
 - Provisioning (WiFi credentials + device name into NVS):
   `tools/provision.sh <port> [name]`. Never commit credentials.
+- **Required VM sdkconfig** (in ~/AtomVM/src/platforms/esp32/sdkconfig +
+  sdkconfig.defaults; a regen drops these and the build/boot breaks):
+  `CONFIG_ULP_COPROC_ENABLED=y`, `CONFIG_ULP_COPROC_TYPE_FSM=y`,
+  `CONFIG_ULP_COPROC_RESERVE_MEM=2048`, and BOTH legacy i2c drivers OFF
+  (`CONFIG_AVM_ENABLE_I2C_PORT_DRIVER=n`,
+  `CONFIG_AVM_ENABLE_I2C_RESOURCE_NIFS=n`) — they call i2c_driver_install,
+  which aborts at boot (`check_i2c_driver_conflict`) against the new
+  esp-idf i2c driver M5Unified uses.
+- `ulp:read_memory/1` must reserve heap before boxing (fixed in the
+  atomvm_ulp checkout): reading it in a loop (latest_valid, harvest)
+  otherwise corrupts the process heap. Any new ULP-memory loop is a
+  heap-pressure risk; verify with a stress loop.
 - **Never call `gpio:deep_sleep_hold_en()`** on these devices: it
   freezes ALL pad states in deep sleep, trapping the ULP sampler's
   SDA/SCL (G0/G26) low → I2C arbitration lost → 0xFFFF samples →
