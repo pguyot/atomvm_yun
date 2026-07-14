@@ -26,24 +26,25 @@
 % timeout) runs regularly while serving.
 -define(SLICE_MS, 300).
 
-%% @doc Serve until InactivityMs pass without a request (a button press
-%% via the tick callback also counts as activity). Tick is called every
-%% ~?SLICE_MS and returns pressed | idle.
--spec serve(Battery :: 0..255, InactivityMs :: pos_integer(), Tick :: fun(() -> pressed | idle)) ->
+%% @doc Serve until InactivityMs pass without a request. Handler is an
+%% event callback: Handler(tick) fires every ~?SLICE_MS (for the display
+%% timeout), Handler({button, Pin}) fires on a BtnA gpio_interrupt
+%% message. Either returning `activity' resets the inactivity window.
+%% Button handling is thus interrupt-driven, not polled.
+-spec serve(Battery :: 0..255, InactivityMs :: pos_integer(), Handler :: fun((term()) -> term())) ->
     ok.
-serve(Battery, InactivityMs, Tick) ->
+serve(Battery, InactivityMs, Handler) ->
     case gen_tcp:listen(80, [binary, {active, false}, {reuseaddr, true}]) of
         {ok, ListenSock} ->
             io:format("http listening on 80\n"),
             Html = atomvm:read_priv(atomvm_yun, "index.html"),
             % gen_tcp:accept/2 timeouts never fire on this AtomVM build,
             % so a dedicated process blocks in accept while this one owns
-            % all timing (tick, inactivity, deadline). Closing the listen
-            % socket ends the acceptor.
+            % all timing and receives button/sntp messages.
             Main = self(),
             spawn(fun() -> acceptor(ListenSock, Html, Battery, Main) end),
             Now = erlang:monotonic_time(millisecond),
-            main_loop(InactivityMs, Tick, Now, Now + ?MAX_SERVE_MS),
+            main_loop(InactivityMs, Handler, Now, Now + ?MAX_SERVE_MS),
             gen_tcp:close(ListenSock),
             ok;
         {error, Reason} ->
@@ -62,7 +63,7 @@ acceptor(ListenSock, Html, Battery, Main) ->
             ok
     end.
 
-main_loop(InactivityMs, Tick, LastActivity, Deadline) ->
+main_loop(InactivityMs, Handler, LastActivity, Deadline) ->
     Now = erlang:monotonic_time(millisecond),
     case Now >= Deadline orelse Now - LastActivity >= InactivityMs of
         true ->
@@ -75,17 +76,18 @@ main_loop(InactivityMs, Tick, LastActivity, Deadline) ->
                     sntp_synchronized ->
                         yun_net:mark_synced(),
                         io:format("clock synchronized: ~p\n", [erlang:system_time(second)]),
-                        LastActivity
+                        LastActivity;
+                    {gpio_interrupt, Pin} ->
+                        activity_time(Handler({button, Pin}), LastActivity)
                 after ?SLICE_MS ->
+                    _ = Handler(tick),
                     LastActivity
                 end,
-            LastActivity2 =
-                case Tick() of
-                    pressed -> erlang:monotonic_time(millisecond);
-                    idle -> LastActivity1
-                end,
-            main_loop(InactivityMs, Tick, LastActivity2, Deadline)
+            main_loop(InactivityMs, Handler, LastActivity1, Deadline)
     end.
+
+activity_time(activity, _Prev) -> erlang:monotonic_time(millisecond);
+activity_time(_, Prev) -> Prev.
 
 handle(Sock, Html, Battery) ->
     case gen_tcp:recv(Sock, 0, 5000) of

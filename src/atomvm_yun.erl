@@ -155,15 +155,17 @@ interactive_wake() ->
             io:format("serving at ~s\n", [Url]),
             m5_display:set_text_size(1),
             m5_display:draw_string(Url, 8, m5_display:height() - 12),
-            % Start on the temperature screen; consume the button press
-            % that woke us so the first NEW press advances the carousel.
+            % Start on the temperature screen. Drive the carousel from a
+            % falling-edge GPIO interrupt on BtnA (active low) rather than
+            % polling -- polling in the 300 ms serve loop missed presses.
             put(screen, 0),
-            m5:update(),
-            _ = m5_btn_a:was_pressed(),
-            % Serving continues in the dark after 15 s; pressing BtnA
-            % while serving cycles the carousel (handled by the tick).
+            put(last_btn, 0),
+            GPIO = gpio:start(),
+            gpio:set_direction(GPIO, ?GPIO_BTN_A, input),
+            gpio:set_int(GPIO, ?GPIO_BTN_A, falling),
             put(display_off_at, erlang:monotonic_time(millisecond) + 15000),
-            yun_http:serve(battery_byte(), 90000, fun() -> serve_tick(Reading, Url) end),
+            yun_http:serve(battery_byte(), 90000, fun(Ev) -> serve_event(Ev, Reading, Url) end),
+            gpio:remove_int(GPIO, ?GPIO_BTN_A),
             yun_net:down();
         {error, not_provisioned} ->
             timer:sleep(?DISPLAY_TIMEOUT_MS);
@@ -251,24 +253,28 @@ battery_byte() ->
             end
     end.
 
-% Runs every ~300 ms while the HTTP server is up. BtnA advances a
-% 3-screen carousel: temperature -> 24 h temperature graph -> battery
-% graph -> back. A press also relights the display; it sleeps 15 s
-% later. Carousel/timeout state lives in the process dictionary.
-serve_tick(Reading0, Url) ->
-    m5:update(),
-    Pressed = m5_btn_a:was_pressed(),
-    case Pressed of
+% Serve-loop event handler. `{button, _}` fires on a BtnA GPIO
+% interrupt and advances the 3-screen carousel (temperature -> 24 h
+% temperature graph -> battery graph -> back); `tick` fires on the
+% loop's idle timeout and only manages the display-off timer. A button
+% press also relights the display, which sleeps 15 s later.
+serve_event({button, _Pin}, Reading0, Url) ->
+    Now = erlang:monotonic_time(millisecond),
+    % Debounce: a mechanical press can fire several falling edges.
+    case Now - get(last_btn) >= 250 of
         true ->
-            Screen = ((get(screen)) + 1) rem 3,
+            put(last_btn, Now),
+            Screen = (get(screen) + 1) rem 3,
             put(screen, Screen),
             m5_display:wakeup(),
             m5_display:set_brightness(128),
             draw_screen(Screen, Reading0, Url),
-            put(display_off_at, erlang:monotonic_time(millisecond) + 15000);
+            put(display_off_at, Now + 15000),
+            activity;
         false ->
-            ok
-    end,
+            idle
+    end;
+serve_event(tick, _Reading0, _Url) ->
     case get(display_off_at) of
         undefined ->
             ok;
@@ -281,10 +287,7 @@ serve_tick(Reading0, Url) ->
                     ok
             end
     end,
-    case Pressed of
-        true -> pressed;
-        false -> idle
-    end.
+    idle.
 
 % Screen 0: current temperature. 1: last-24 h temperature graph.
 % 2: battery-level graph.
