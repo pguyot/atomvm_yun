@@ -47,6 +47,13 @@ chip — never delete it.
   ULP fence; never talk to the hat outside that bracket.
 - Provisioning (WiFi credentials + device name into NVS):
   `tools/provision.sh <port> [name]`. Never commit credentials.
+- **The `thermolog` partition line in ~/AtomVM/src/platforms/esp32/
+  partitions.csv is REQUIRED** (`thermolog, data, 0x40, 0x350000,
+  0xB0000` after main.avm) and is a tracked file — git operations
+  (bisect/checkout/stash) in the AtomVM repo silently revert it. Without
+  it esp:partition_* returns error, the flash log never writes, and the
+  graphs stay empty. After any AtomVM git op, re-check partitions.csv,
+  sdkconfig, and rebuild+reflash the VM.
 - **Required VM sdkconfig** (in ~/AtomVM/src/platforms/esp32/sdkconfig +
   sdkconfig.defaults; a regen drops these and the build/boot breaks):
   `CONFIG_ULP_COPROC_ENABLED=y`, `CONFIG_ULP_COPROC_TYPE_FSM=y`,
