@@ -155,8 +155,13 @@ interactive_wake() ->
             io:format("serving at ~s\n", [Url]),
             m5_display:set_text_size(1),
             m5_display:draw_string(Url, 8, m5_display:height() - 12),
+            % Start on the temperature screen; consume the button press
+            % that woke us so the first NEW press advances the carousel.
+            put(screen, 0),
+            m5:update(),
+            _ = m5_btn_a:was_pressed(),
             % Serving continues in the dark after 15 s; pressing BtnA
-            % while serving relights and redraws (handled by the tick).
+            % while serving cycles the carousel (handled by the tick).
             put(display_off_at, erlang:monotonic_time(millisecond) + 15000),
             yun_http:serve(battery_byte(), 90000, fun() -> serve_tick(Reading, Url) end),
             yun_net:down();
@@ -246,24 +251,20 @@ battery_byte() ->
             end
     end.
 
-% Runs every ~300 ms while the HTTP server is up: BtnA relights the
-% display with a fresh reading; the display sleeps again 15 s later.
-% State lives in the process dictionary of the serving process.
+% Runs every ~300 ms while the HTTP server is up. BtnA advances a
+% 3-screen carousel: temperature -> 24 h temperature graph -> battery
+% graph -> back. A press also relights the display; it sleeps 15 s
+% later. Carousel/timeout state lives in the process dictionary.
 serve_tick(Reading0, Url) ->
     m5:update(),
     Pressed = m5_btn_a:was_pressed(),
     case Pressed of
         true ->
+            Screen = ((get(screen)) + 1) rem 3,
+            put(screen, Screen),
             m5_display:wakeup(),
             m5_display:set_brightness(128),
-            Reading =
-                case yun_sampler:latest() of
-                    {error, _} -> Reading0;
-                    Latest -> Latest
-                end,
-            draw_ui(Reading, m5_power:get_battery_level()),
-            m5_display:set_text_size(1),
-            m5_display:draw_string(Url, 8, m5_display:height() - 12),
+            draw_screen(Screen, Reading0, Url),
             put(display_off_at, erlang:monotonic_time(millisecond) + 15000);
         false ->
             ok
@@ -284,6 +285,22 @@ serve_tick(Reading0, Url) ->
         true -> pressed;
         false -> idle
     end.
+
+% Screen 0: current temperature. 1: last-24 h temperature graph.
+% 2: battery-level graph.
+draw_screen(0, Reading0, Url) ->
+    Reading =
+        case yun_sampler:latest_valid() of
+            {ok, _} = Ok -> Ok;
+            _ -> Reading0
+        end,
+    draw_ui(Reading, m5_power:get_battery_level()),
+    m5_display:set_text_size(1),
+    m5_display:draw_string(Url, 8, m5_display:height() - 12);
+draw_screen(1, _Reading0, _Url) ->
+    draw_temp_graph();
+draw_screen(2, _Reading0, _Url) ->
+    draw_batt_graph().
 
 % Panel sleep alone leaves the AXP192-driven backlight lit on the
 % StickC Plus; cut the brightness too or the screen stays visibly on.
@@ -372,6 +389,116 @@ draw_battery(Level) when is_integer(Level), Level >= 0, Level =< 100 ->
     m5_display:draw_string(Pct, X - 4 - 6 * byte_size(Pct), Y + 4);
 draw_battery(_Unknown) ->
     ok.
+
+-define(COL_GRID, 16#404040).
+-define(COL_TEMP, 16#00E5FF).
+-define(COL_BATT, 16#00C853).
+-define(COL_TXT, 16#FFFFFF).
+
+% Temperature samples (tenths of a degree), oldest first, for roughly the
+% last 24 h: harvested history from the flash log plus the not-yet-
+% harvested tail still in the ULP ring. Error/empty samples are dropped.
+temp_series() ->
+    Records = yun_log:last_records(24),
+    FlashRaw = lists:append([maps:get(samples, R) || R <- Records]),
+    {_, RingRaw} = yun_sampler:harvest(nvs_harvest_count()),
+    Tenths = [
+        (yun_sampler:raw_to_millicelsius(S) + 50) div 100
+     || S <- FlashRaw ++ RingRaw, S > 0, S < 16#FFF0
+    ],
+    last_n(Tenths, 288).
+
+% Battery percentage, oldest first, one point per hourly record plus the
+% current level as the newest point.
+batt_series() ->
+    Records = yun_log:last_records(24),
+    Hist = [
+        maps:get(battery, R) band 16#7F
+     || R <- Records, maps:get(battery, R) =/= 16#FF
+    ],
+    Now =
+        case m5_power:get_battery_level() of
+            L when is_integer(L), L >= 0, L =< 100 -> [L];
+            _ -> []
+        end,
+    last_n(Hist ++ Now, 96).
+
+last_n(L, N) ->
+    lists:nthtail(max(0, length(L) - N), L).
+
+draw_temp_graph() ->
+    case temp_series() of
+        Vals when length(Vals) >= 2 ->
+            Lo = lists:min(Vals),
+            Hi = lists:max(Vals),
+            % pad by ~0.5 C and guarantee a non-zero range
+            Pad = max(5, (Hi - Lo) div 8),
+            draw_graph(
+                <<"Temp / 24h">>,
+                Vals,
+                Lo - Pad,
+                Hi + Pad,
+                fun tenths_label/1,
+                ?COL_TEMP
+            );
+        _ ->
+            draw_collecting(<<"Temp / 24h">>)
+    end.
+
+draw_batt_graph() ->
+    case batt_series() of
+        Vals when length(Vals) >= 2 ->
+            draw_graph(<<"Battery / 24h">>, Vals, 0, 100, fun pct_label/1, ?COL_BATT);
+        _ ->
+            draw_collecting(<<"Battery / 24h">>)
+    end.
+
+tenths_label(T) -> list_to_binary(io_lib:format("~B.~B", [T div 10, abs(T rem 10)])).
+pct_label(P) -> list_to_binary(io_lib:format("~B", [P])).
+
+% Line graph of Vals (oldest->newest, evenly spaced on X) with a value
+% axis from Min to Max. LabelFun formats the Y bounds.
+draw_graph(Title, Vals, Min, Max, LabelFun, Color) ->
+    W = m5_display:width(),
+    H = m5_display:height(),
+    L = 34,
+    R = W - 6,
+    T = 20,
+    B = H - 14,
+    Range = max(1, Max - Min),
+    N = length(Vals),
+    m5_display:start_write(),
+    m5_display:fill_screen(16#000000),
+    m5_display:set_text_size(1),
+    m5_display:draw_string(Title, 6, 4),
+    % axes
+    m5_display:draw_fast_hline(L, B, R - L, ?COL_GRID),
+    m5_display:draw_fast_vline(L, T, B - T, ?COL_GRID),
+    % Y bounds
+    m5_display:draw_string(LabelFun(Max), 2, T - 3),
+    m5_display:draw_string(LabelFun(Min), 2, B - 6),
+    % X range
+    m5_display:draw_string(<<"-24h">>, L, B + 3),
+    m5_display:draw_string(<<"now">>, R - 18, B + 3),
+    X = fun(I) -> L + (R - L) * I div (N - 1) end,
+    Y = fun(V) -> B - (B - T) * (V - Min) div Range end,
+    draw_polyline(Vals, X, Y, Color, 0),
+    m5_display:end_write().
+
+draw_polyline([_], _X, _Y, _Color, _I) ->
+    ok;
+draw_polyline([V1, V2 | Rest], X, Y, Color, I) ->
+    m5_display:draw_line(X(I), Y(V1), X(I + 1), Y(V2), Color),
+    draw_polyline([V2 | Rest], X, Y, Color, I + 1).
+
+draw_collecting(Title) ->
+    m5_display:start_write(),
+    m5_display:fill_screen(16#000000),
+    m5_display:set_text_size(1),
+    m5_display:draw_string(Title, 6, 4),
+    m5_display:set_text_size(2),
+    m5_display:draw_string(<<"collecting...">>, 20, m5_display:height() div 2 - 8),
+    m5_display:end_write().
 
 % Exercise the YUN Hat STM32 running the low-power firmware (YUN/README.md):
 % version read proves the wake-retry works, LEDs prove 0x01 is intact, light
